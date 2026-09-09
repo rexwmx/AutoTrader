@@ -165,7 +165,20 @@ def update_close_data_in_csv(filepath: Path, code: str, open_action: str, close_
                 logger.warning(f"⚠️ 未找到 {code} ({open_action}) 的未平仓记录")
                 return False
 
-            idx = df[mask].index[-1]
+            # FIFO：平仓数据回写到最早的未平仓开仓记录（同一标的多次开仓时按开仓先后覆盖）
+            idx = df[mask].index[0]
+
+            # 数量核对提示：平仓数量 ≠ 开仓记录数量（开仓阶段可能部分成交/记录不准），人工核对
+            try:
+                _row_vol = int(float(df.loc[idx, 'vol']))
+                _close_vol = int(float(close_data.get('close_vol', 0)))
+                if _row_vol != _close_vol:
+                    logger.warning(
+                        f"⚠️ {code} ({open_action}): 开仓记录 {_row_vol}股 ≠ 实际平仓 {_close_vol}股 —— "
+                        f"开仓阶段记录可能不准，请人工核对两账户"
+                    )
+            except Exception:
+                pass
 
             for k, v in close_data.items():
                 if k in df.columns:

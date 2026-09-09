@@ -16,6 +16,7 @@ from order import (
     cancel_order, get_fill_price, get_filled_volume
 )
 from monitor import wait_for_trade_completion
+from position import get_positions
 from csv_writer import append_trade_record
 from util import calculate_shares, format_datetime
 from logger import get_logger
@@ -24,10 +25,16 @@ from constants import (
 )
 
 
-async def verify_buy_position(ib2: IB, symbol: str, retries: int = 3, delay: float = 5.0) -> dict:
+async def verify_buy_position(ib2: IB, symbol: str, expected_volume: int = 0,
+                              retries: int = 3, delay: float = 5.0) -> dict:
     """
     验证账户2是否实际持有该股票的买入持仓
     用于处理买入订单的"假Cancelled"问题
+
+    基于权威持仓快照（reqPositionsAsync 返回值）实现，
+    不依赖 ib.positions() 长寿命缓存（幽灵条目会造成假阳性）。
+    expected_volume>0 时同时校验成交数量达到卖空数量，
+    不足视为未成交，缺口由阶段7调平补全。
 
     Returns:
         dict: {'exists': bool, 'volume': int, 'avg_cost': float}
@@ -37,14 +44,13 @@ async def verify_buy_position(ib2: IB, symbol: str, retries: int = 3, delay: flo
         if attempt > 0:
             await asyncio.sleep(delay)
         try:
-            await ib2.reqPositionsAsync()
-            await asyncio.sleep(1)
-            positions = {p.contract.symbol: p for p in ib2.positions()}
-            if symbol in positions and positions[symbol].position > 0:
+            positions = await get_positions(ib2)
+            hit = positions.get(symbol)
+            if hit and hit['position'] > 0 and (not expected_volume or hit['position'] >= expected_volume):
                 return {
                     'exists': True,
-                    'volume': int(positions[symbol].position),
-                    'avg_cost': float(positions[symbol].avgCost)
+                    'volume': int(hit['position']),
+                    'avg_cost': float(hit['avgCost'])
                 }
         except Exception as e:
             logger.debug(f"🔍 {symbol}: 验证买入持仓异常: {e}")
@@ -125,7 +131,7 @@ async def perform_hedging(
         # ==================== 关键修复：买入订单持仓验证 ====================
         if buy_status != 'Filled':
             logger.debug(f"🔍 {symbol}: 买入订单状态 {buy_status}，验证账户2实际持仓...")
-            pos_info = await verify_buy_position(ib2, symbol)
+            pos_info = await verify_buy_position(ib2, symbol, vol)
             if pos_info['exists']:
                 buy_status = 'Filled'
                 hedge_order.buy_price = pos_info['avg_cost']

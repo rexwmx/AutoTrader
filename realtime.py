@@ -5,6 +5,7 @@
 支持历史K线回放补全，追踪建仓后的价格极值用于平仓判断
 建仓后极值字段仅在建仓成功后的下一分钟开始才有数据
 """
+import asyncio
 import pandas as pd
 import pytz
 from pathlib import Path
@@ -186,13 +187,18 @@ class RealtimeDataRecorder:
                     row_df.to_csv(csv_path, mode="a", header=False, index=False)
 
                     # ==================== 触发平仓检查 ====================
+                    # check_runtime_conditions 现在是 async（内部使用权威持仓快照），
+                    # 从K线回调里以任务方式调度；异常隔离，不破坏K线写入
                     if self.close_manager and is_after_entry:
-                        self.close_manager.check_runtime_conditions(
-                            symbol,
-                            bar.close,
-                            stats["min_since_entry"] if stats["min_since_entry"] else bar.close,
-                            stats["max_since_entry"] if stats["max_since_entry"] else bar.close
-                        )
+                        try:
+                            asyncio.create_task(self.close_manager.check_runtime_conditions(
+                                symbol,
+                                bar.close,
+                                stats["min_since_entry"] if stats["min_since_entry"] else bar.close,
+                                stats["max_since_entry"] if stats["max_since_entry"] else bar.close
+                            ))
+                        except RuntimeError as e:
+                            self.logger.error(f"❌ [{symbol}] 无法调度运行时平仓检查: {e}")
 
             except Exception as e:
                 self.logger.error(f"❌ [{symbol}] 1分钟数据处理异常: {e}")

@@ -32,7 +32,7 @@ from database import (
 from selector import select_stocks
 from csv_writer import write_selected_stocks, init_trade_csv
 from hedge import perform_hedging
-from position import reconcile_positions
+from position import reconcile_positions, get_positions
 from realtime import RealtimeDataRecorder
 from close import CloseManager  # 新增导入
 
@@ -230,16 +230,11 @@ async def main():
 
     # ==================== 关键修复：基于TWS实际持仓判断 ====================
     # 不依赖 hedged_stocks 列表，而是检查TWS实际持仓
-    await asyncio.sleep(5)  # 等待TWS持仓数据稳定
-    try:
-        await ib1.reqPositionsAsync()
-        await ib2.reqPositionsAsync()
-        await asyncio.sleep(2)
-    except Exception:
-        pass
-
-    pos1_all = {p.contract.symbol: p for p in ib1.positions() if p.position != 0}
-    pos2_all = {p.contract.symbol: p for p in ib2.positions() if p.position != 0}
+    # 使用权威快照（reqPositionsAsync 返回值），修复
+    # "请求 + 固定sleep + 读长寿命缓存"的竞态（幽灵条目/半批读取会漏算对冲名单）
+    await asyncio.sleep(5)  # 等待TWS完成调平单的持仓更新
+    pos1_all = await get_positions(ib1, account1)
+    pos2_all = await get_positions(ib2, account2)
 
     # 找出两个账户都有持仓的股票（即实际成功对冲的）
     actual_hedged_symbols = set(pos1_all.keys()) & set(pos2_all.keys())
@@ -262,6 +257,29 @@ async def main():
         f"📊 TWS实际持仓: 账户1={len(pos1_all)}只, 账户2={len(pos2_all)}只, "
         f"实际对冲={len(actual_hedged_symbols)}只"
     )
+
+    # ==================== 对账审计：CSV开仓记录 vs 实际对冲名单 ====================
+    try:
+        import pandas as pd
+        open_codes = set()
+        for _path, _action in ((sell_csv_path, 'sell'), (buy_csv_path, 'buy')):
+            _df = pd.read_csv(_path)
+            if _df.empty:
+                continue
+            _empty = (_df['close_datetime'].isna()
+                      | (_df['close_datetime'].astype(str).str.strip() == '')
+                      | (_df['close_datetime'].astype(str).str.lower() == 'nan'))
+            open_codes |= set(_df.loc[(_df['action'] == _action) & _empty, 'code'])
+        _missing = sorted(open_codes - actual_hedged_symbols)
+        if _missing:
+            logger.critical(
+                f"🚨 CSV存在开仓记录但不在两账户实际对冲名单: {_missing} "
+                f"—— 将不做1分钟监控，请人工核对TWS持仓"
+            )
+        else:
+            logger.info("✅ 开仓对账通过: CSV开仓清单与两账户实际对冲名单一致")
+    except Exception as e:
+        logger.warning(f"⚠️ 开仓对账检查失败: {e}")
 
     if actual_hedged_stocks:
         # 初始化平仓管理器
@@ -300,7 +318,19 @@ async def main():
                 now_est = get_current_time_est()
                 if force_close_dt and now_est >= force_close_dt:
                     logger.info("⏰ 到达收市前10分钟，触发强制平仓...")
-                    await close_manager.force_close_until_flat(timeout_minutes=10)
+                    # 多轮强制平仓：单轮不收敛（超时）立即再开下一轮，
+                    # 直到清仓或达到总时限 —— 绝不带着残留仓位静默退出
+                    flat = False
+                    deadline = datetime.datetime.now() + datetime.timedelta(minutes=45)
+                    while not flat and datetime.datetime.now() < deadline:
+                        flat = await close_manager.force_close_until_flat(timeout_minutes=10)
+                        if not flat:
+                            logger.critical("⚠️ 本轮强制平仓后仍有残留，30秒后继续下一轮...")
+                            await asyncio.sleep(30)
+                    if not flat:
+                        logger.critical(
+                            "🚨 45分钟内多轮强制平仓仍未清仓 —— 请立即人工核查两个账户的TWS持仓并手动平仓！"
+                        )
                     break
                 await asyncio.sleep(10)
         except (KeyboardInterrupt, asyncio.CancelledError):
