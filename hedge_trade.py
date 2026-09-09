@@ -365,7 +365,7 @@ if __name__ == "__main__":
     except Exception as e:
         # ==================== 兜底崩溃日志 ====================
         # 如果程序在日志系统初始化前就崩溃，将错误写入固定的 crash.log
-        crash_log_path = Path(r'C:\trader\selection\hedge_trade\crash.log')
+        crash_log_path = BASE_RUNTIME_DIR / 'crash.log'
         try:
             crash_log_path.parent.mkdir(parents=True, exist_ok=True)
             with open(crash_log_path, 'a', encoding='utf-8') as f:

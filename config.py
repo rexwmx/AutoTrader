@@ -20,8 +20,8 @@ ACCOUNT2_CLIENT_ID = 1002
 DB_URL = "postgresql://postgres:wangyang@localhost:5432/postgres"
 
 # ==================== 路径配置 ====================
-# 基础运行目录
-BASE_RUNTIME_DIR = Path(r'C:\trader\selection\hedge_trade')
+# 基础运行目录（基于当前项目根目录的相对路径，输出到 AutoTrader/trade_log）
+BASE_RUNTIME_DIR = Path(__file__).resolve().parent / 'trade_log'
 
 # 1分钟数据子目录名
 MINUTE_DATA_DIR = '1min'
