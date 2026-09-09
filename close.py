@@ -22,6 +22,20 @@ CLOSE_MAX_RETRIES = 1
 CLOSE_CHECK_INTERVAL = 30     # 强平循环轮间检查间隔（秒）
 
 
+def normalize_side(side: str) -> str:
+    """
+    归一化成交方向为 'BUY'/'SELL'（大小写不敏感）。
+
+    关键：IBKR TWS API 的 Execution.side 协议枚举值是 **'BOT'(买) / 'SLD'(卖)**，
+    官方文档："Specifies if the transaction was buy or sale, BOT for bought, SLD for sold."
+    ib_async 解码器把协议字符串原样透传，因此与 'BUY'/'SELL' 直接比较**永远为 False**
+    （9.8 事故中 ASAN 退出前补写因此瘫痪，输出"无需补写"）。
+    本函数同时兼容真实协议值与语义值，供所有 side 比较使用。
+    """
+    s = str(side).upper()
+    return {'BOT': 'BUY', 'SLD': 'SELL'}.get(s, s)
+
+
 def get_close_pct(peak_pct: float) -> float:
     """
     根据峰值涨幅/跌幅百分比，查表得到对应的平仓线百分比。
@@ -254,7 +268,12 @@ class CloseManager:
                     self.logger.warning(f"⚠️ {symbol}: 重试前持仓复核失败: {e}")
 
                 if live is not None:
-                    target_still_open = ((close_action == 'buy') == (live < 0))
+                    # 方向显式判断（修复 9.8 ASAN 事故 Bug：旧式 (close_action=='buy')==(live<0)
+                    # 在 close_action='sell' 且 live==0 时 False==False→True，
+                    # 把"目标仓位已归零"误判为"仍持仓"，对 0 仓盲目补单→超时失败）：
+                    #   buy 平空：目标仓 = 空头 (live<0)
+                    #   sell 平多：目标仓 = 多头 (live>0)
+                    target_still_open = (live < 0) if close_action == 'buy' else (live > 0)
                     if not target_still_open:
                         self.logger.info(
                             f"🔍 {symbol}: 重试前目标方向持仓已不存在 (当前 {live:+d}股，"
@@ -565,6 +584,8 @@ class CloseManager:
         Args:
             fills: TWS fills 列表
             close_side: 平仓方向 ('BUY' 表示做空平仓, 'SELL' 表示做多平仓)
+                        注意：fills 内的 f.execution.side 是 TWS 协议值 'BOT'/'SLD'，
+                        必须经 normalize_side() 归一化后再比较（直接 == 恒为 False）
             open_action: 开仓方向 ('sell' 或 'buy')
             csv_path: CSV 文件路径
         """
@@ -591,7 +612,8 @@ class CloseManager:
         fill_vol_by_symbol = {}
         fill_cost_by_symbol = {}
         for f in fills:
-            if f.execution.side == close_side:
+            # 必须归一化：TWS 协议 side 值为 BOT/SLD，直接 == 'BUY'/'SELL' 恒为 False
+            if normalize_side(f.execution.side) == normalize_side(close_side):
                 try:
                     sh = abs(int(float(f.execution.shares)))
                 except Exception:

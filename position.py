@@ -4,6 +4,7 @@
 增加"假Cancelled"持仓验证：无论订单状态如何，以实际持仓为准
 """
 import asyncio
+from pathlib import Path
 from typing import Dict
 from ib_async import IB
 from order import submit_buy_order, submit_sell_order, get_fill_price, get_filled_volume
@@ -147,6 +148,94 @@ async def verify_position_after_order(ib: IB, account: str, symbol: str,
 
 RECONCILE_MAX_ROUNDS = 3                 # 定点调平最大轮数
 RECONCILE_ROUND_SETTLE_SECONDS = 10      # 每轮开始前等待（让TWS完成持仓更新）
+
+
+def backfill_missing_open_records(
+        positions1: Dict[str, dict],
+        positions2: Dict[str, dict],
+        sell_csv_path=None, buy_csv_path=None,
+        stock_info_map=None,
+) -> None:
+    """
+    CSV开仓记录对账补写（终态持仓 → CSV）
+
+    修复 9.8 PL 事故根因：建仓时对冲单被"假 Cancelled"误判为未成交（sell_only），
+    对应 openCSV 行未写入；随后 TWS 延迟成交，两账户终态恰好对称 ——
+    调平只看"两账户间对称性"（_compute_adjustments 差额为 0，不发单），
+    而原有补写钩子挂在"调平单成交"之后，于是**永远没有机会执行**，CSV 单边缺行。
+
+    本函数以权威终态快照为准逐边检查：
+      - 账户1 某标有空头，但 sell.csv 无该代码开仓行 → 补写（入场价 = 账户1 avgCost）
+      - 账户2 某标的有多头，但 buy.csv 无该代码开仓行 → 补写（入场价 = 账户2 avgCost）
+    快照获取失败（空字典）时不做任何补写，保证不误写。
+    """
+    logger = get_logger()
+
+    def _open_row_codes(path: Path, action: str) -> set:
+        if not path or not Path(path).exists():
+            return set()
+        try:
+            import pandas as pd
+            df = pd.read_csv(path)
+            if df.empty:
+                return set()
+            return set(df.loc[df['action'] == action, 'code'])
+        except Exception as e:
+            logger.warning(f"⚠️ 读取 {Path(path).name} 开仓代码失败: {e}")
+            return set()
+
+    def _info(symbol: str):
+        if stock_info_map and symbol in stock_info_map:
+            s = stock_info_map[symbol]
+            return s.exchange, s.industry
+        return '', ''
+
+    sell_codes = _open_row_codes(sell_csv_path, 'sell')
+    buy_codes = _open_row_codes(buy_csv_path, 'buy')
+
+    # 账户1 空头 → sell.csv 应有开仓行
+    for symbol, pos1 in positions1.items():
+        if pos1['position'] >= 0 or not sell_csv_path:
+            continue
+        if symbol in sell_codes:
+            continue
+        vol = abs(int(pos1['position']))
+        price = float(pos1['avgCost'])
+        exchange, industry = _info(symbol)
+        cost = price * vol
+        now_str = format_datetime(datetime.datetime.now())
+        append_trade_record(TradeRecord(
+            datetime=now_str, code=symbol,
+            exchange=exchange, industry=industry,
+            action='sell', entry_price=price,
+            vol=vol, total_cost=cost, fund_used=cost
+        ), sell_csv_path)
+        logger.critical(
+            f"🧾 开仓记录缺失补写 (sell.csv): {symbol} {vol}股 @ ${price:.2f} "
+            f"（来源: 账户1终态持仓快照 avgCost；建仓阶段该单曾被误判为未成交）"
+        )
+
+    # 账户2 多头 → buy.csv 应有开仓行
+    for symbol, pos2 in positions2.items():
+        if pos2['position'] <= 0 or not buy_csv_path:
+            continue
+        if symbol in buy_codes:
+            continue
+        vol = int(pos2['position'])
+        price = float(pos2['avgCost'])
+        exchange, industry = _info(symbol)
+        cost = price * vol
+        now_str = format_datetime(datetime.datetime.now())
+        append_trade_record(TradeRecord(
+            datetime=now_str, code=symbol,
+            exchange=exchange, industry=industry,
+            action='buy', entry_price=price,
+            vol=vol, total_cost=cost, fund_used=cost
+        ), buy_csv_path)
+        logger.critical(
+            f"🧾 开仓记录缺失补写 (buy.csv): {symbol} {vol}股 @ ${price:.2f} "
+            f"（来源: 账户2终态持仓快照 avgCost；建仓阶段该单曾被误判为未成交）"
+        )
 
 
 def _compute_adjustments(positions1: Dict[str, dict],
@@ -353,6 +442,15 @@ async def reconcile_positions(
     # ==================== 终态确认（权威快照） ====================
     positions1_final = await get_positions(ib1, account1)
     positions2_final = await get_positions(ib2, account2)
+
+    # ==================== CSV开仓记录对账补写（对称持仓盲点修复） ====================
+    # 两账户对称≠CSV完整：缺行标的不会触发调平单，只能由这里兜底
+    # （仅当传入 CSV 路径时生效；路径为 None 则安全跳过）
+    backfill_missing_open_records(
+        positions1_final, positions2_final,
+        sell_csv_path, buy_csv_path, stock_info_map
+    )
+
     remaining = _compute_adjustments(positions1_final, positions2_final, ib2, account2)
 
     if remaining:

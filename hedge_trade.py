@@ -258,26 +258,52 @@ async def main():
         f"实际对冲={len(actual_hedged_symbols)}只"
     )
 
-    # ==================== 对账审计：CSV开仓记录 vs 实际对冲名单 ====================
+    # ==================== 对账审计：CSV开仓记录 vs 实际对冲名单（双向） ====================
+    # 修复 9.8 PL 事故根因：旧版只用"两CSV并集 - 实际对冲名单"的子集检查，
+    # "单边缺行"（PL 在 sell.csv 有、buy.csv 无，但两账户都持仓）会被并集掩盖 → 假通过。
+    # 现改为三向核对：单边缺失 / CSV有而TWS无 / TWS有而CSV两边都无。
     try:
         import pandas as pd
-        open_codes = set()
-        for _path, _action in ((sell_csv_path, 'sell'), (buy_csv_path, 'buy')):
-            _df = pd.read_csv(_path)
+
+        def _unclosed_open_codes(path, action):
+            _df = pd.read_csv(path)
             if _df.empty:
-                continue
+                return set()
             _empty = (_df['close_datetime'].isna()
                       | (_df['close_datetime'].astype(str).str.strip() == '')
                       | (_df['close_datetime'].astype(str).str.lower() == 'nan'))
-            open_codes |= set(_df.loc[(_df['action'] == _action) & _empty, 'code'])
-        _missing = sorted(open_codes - actual_hedged_symbols)
-        if _missing:
+            return set(_df.loc[(_df['action'] == action) & _empty, 'code'])
+
+        sell_open = _unclosed_open_codes(sell_csv_path, 'sell')
+        buy_open = _unclosed_open_codes(buy_csv_path, 'buy')
+
+        # 1) 单边缺失：一边有开仓、另一边没有（对冲开仓本应双边对称，出现即记账错误）
+        only_sell = sorted(sell_open - buy_open)
+        only_buy = sorted(buy_open - sell_open)
+        # 2) CSV 有开仓但两账户无此对冲持仓（裸露风险，且不会进入1分钟监控名单）
+        missing_hedge = sorted((sell_open | buy_open) - actual_hedged_symbols)
+        # 3) TWS 有对冲持仓但 CSV 两边都无开仓记录（正常应已被调平阶段补写，出现即补写失败）
+        no_csv = sorted(actual_hedged_symbols - (sell_open | buy_open))
+
+        if only_sell or only_buy or missing_hedge or no_csv:
+            _parts = []
+            if only_sell:
+                _parts.append(f"sell侧有开仓但buy侧缺失: {only_sell}")
+            if only_buy:
+                _parts.append(f"buy侧有开仓但sell侧缺失: {only_buy}")
+            if missing_hedge:
+                _parts.append(f"CSV有开仓但不在两账户实际对冲名单: {missing_hedge}")
+            if no_csv:
+                _parts.append(f"TWS有对冲持仓但两侧CSV均无开仓记录: {no_csv}")
             logger.critical(
-                f"🚨 CSV存在开仓记录但不在两账户实际对冲名单: {_missing} "
-                f"—— 将不做1分钟监控，请人工核对TWS持仓"
+                "🚨 开仓对账发现缺口: " + "; ".join(_parts)
+                + " —— CSV账目不完整，请人工核对TWS持仓与两侧CSV开仓记录"
             )
         else:
-            logger.info("✅ 开仓对账通过: CSV开仓清单与两账户实际对冲名单一致")
+            logger.info(
+                "✅ 开仓对账通过: sell/buy 两侧开仓清单相互一致，"
+                "且与两账户实际对冲名单双向吻合"
+            )
     except Exception as e:
         logger.warning(f"⚠️ 开仓对账检查失败: {e}")
 

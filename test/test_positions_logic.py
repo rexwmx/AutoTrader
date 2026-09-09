@@ -214,6 +214,54 @@ async def main():
     if not ok:
         failures.append('P6')
 
+    # ---------- P7: 两账户对称但 CSV 单边缺开仓行（9.8 PL 事故）→ 终态补写 ----------
+    # 旧代码：对称 → 无调平单 → 补写钩子（挂在调平单成交后）永不执行 → buy.csv 永久缺 PL。
+    # 新代码：终态快照逐边核对 CSV，缺行即按该账户 avgCost 补写。
+    import tempfile
+    import pandas as pd
+    from constants import TRADE_RECORD_COLUMNS
+
+    P7_TMP = Path(tempfile.mkdtemp(prefix='pos_backfill_test_'))
+    buy_p7 = P7_TMP / 'buy.csv'
+    sell_p7 = P7_TMP / 'sell.csv'
+    # sell.csv 有 X 的开仓行；buy.csv 空表（X 的 buy 开仓行缺失，模拟 PL）
+    pd.DataFrame([{
+        'datetime': '2026-09-08 09:30:16', 'code': 'X', 'exchange': 'NYSE', 'industry': 'Tech',
+        'action': 'sell', 'entry_price': 17.87, 'vol': 56, 'total_cost': 1000.72, 'fund_used': 1000.72,
+        'close_datetime': '', 'close_price': '', 'close_vol': '', 'close_fund': '',
+        'gross_profit': '', 'profit': ''
+    }]).reindex(columns=TRADE_RECORD_COLUMNS).to_csv(sell_p7, index=False, encoding='utf-8-sig')
+    pd.DataFrame(columns=TRADE_RECORD_COLUMNS).to_csv(buy_p7, index=False, encoding='utf-8-sig')
+
+    clear()
+    buy_calls.clear()
+    sell_calls.clear()
+    ib1 = ScriptedIB([[FakePos('X', -56, 17.85, 'D1')]])
+    ib2 = ScriptedIB([[FakePos('X', +56, 18.02, 'D2')]])
+
+    # P7 走真实写盘路径（csv_writer.append_trade_record），端到端验证 CSV 内容
+    import csv_writer as CW
+    orig_append = P.append_trade_record
+    P.append_trade_record = CW.append_trade_record
+    try:
+        await P.reconcile_positions(ib1, ib2, 'D1', 'D2',
+                                    sell_csv_path=sell_p7, buy_csv_path=buy_p7)
+    finally:
+        P.append_trade_record = orig_append  # 恢复打桩，不影响后续用例
+
+    df7 = pd.read_csv(buy_p7) if buy_p7.exists() else None
+    written = (df7 is not None and not df7.empty
+               and df7.iloc[0]['code'] == 'X' and df7.iloc[0]['action'] == 'buy'
+               and int(float(df7.iloc[0]['vol'])) == 56
+               and abs(float(df7.iloc[0]['entry_price']) - 18.02) < 1e-9)
+    df_sell7 = pd.read_csv(sell_p7)
+    no_sell_dup = int((df_sell7['code'] == 'X').sum()) == 1  # 已有行不得重复补写
+    ok = (not buy_calls and not sell_calls and written and no_sell_dup)
+    print(f'[{"ok" if ok else "FAIL"}] P7 对称持仓+buy侧缺行→补写buy.csv(账户2均价), 无重复补写: '
+          f'orders={buy_calls}+{sell_calls}, written={written}, no_dup={no_sell_dup}')
+    if not ok:
+        failures.append('P7')
+
     # ---------- H1: 验证全量成交 ----------
     ib = ScriptedIB([[FakePos('X', +100, 10, 'D2')]])
     r = await H.verify_buy_position(ib, 'X', 100)
