@@ -332,7 +332,7 @@ async def main():
             close_hour, close_minute = map(int, close_time.split(':'))
             now_est = get_current_time_est()
             close_dt = now_est.replace(hour=close_hour, minute=close_minute, second=0, microsecond=0)
-            force_close_dt = close_dt - datetime.timedelta(minutes=10)
+            force_close_dt = close_dt - datetime.timedelta(minutes=5)
             logger.info(f"⏰ 强制平仓触发时间设定为: {force_close_dt.strftime('%H:%M:%S')} 美东时间")
         except Exception as e:
             logger.error(f"❌ 解析收市时间失败: {e}")
@@ -343,19 +343,19 @@ async def main():
             while True:
                 now_est = get_current_time_est()
                 if force_close_dt and now_est >= force_close_dt:
-                    logger.info("⏰ 到达收市前10分钟，触发强制平仓...")
+                    logger.info("⏰ 到达收市前5分钟，触发强制平仓...")
                     # 多轮强制平仓：单轮不收敛（超时）立即再开下一轮，
                     # 直到清仓或达到总时限 —— 绝不带着残留仓位静默退出
                     flat = False
-                    deadline = datetime.datetime.now() + datetime.timedelta(minutes=45)
+                    deadline = datetime.datetime.now() + datetime.timedelta(minutes=5)
                     while not flat and datetime.datetime.now() < deadline:
-                        flat = await close_manager.force_close_until_flat(timeout_minutes=10)
+                        flat = await close_manager.force_close_until_flat(timeout_minutes=5)
                         if not flat:
                             logger.critical("⚠️ 本轮强制平仓后仍有残留，30秒后继续下一轮...")
                             await asyncio.sleep(30)
                     if not flat:
                         logger.critical(
-                            "🚨 45分钟内多轮强制平仓仍未清仓 —— 请立即人工核查两个账户的TWS持仓并手动平仓！"
+                            "🚨 5分钟内多轮强制平仓仍未清仓 —— 请立即人工核查两个账户的TWS持仓并手动平仓！"
                         )
                     break
                 await asyncio.sleep(10)

@@ -393,7 +393,7 @@ class CloseManager:
         finally:
             self.force_close_active = False
 
-    async def force_close_until_flat(self, timeout_minutes: int = 10) -> bool:
+    async def force_close_until_flat(self, timeout_minutes: int = 5) -> bool:
         """
         强制平仓循环（收敛保证版）
 
