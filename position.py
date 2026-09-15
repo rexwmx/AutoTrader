@@ -5,7 +5,7 @@
 """
 import asyncio
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 from ib_async import IB
 from order import submit_buy_order, submit_sell_order, get_fill_price, get_filled_volume
 from monitor import wait_for_trade_completion
@@ -96,6 +96,35 @@ async def get_positions_strict(ib: IB, account: str = "") -> Dict[str, dict]:
             'contract': p.contract
         }
     return result
+
+
+class PositionSnapshotError(RuntimeError):
+    """持仓快照获取失败（已重试）——绝不能被当作"无持仓"处理"""
+
+
+async def get_positions_strict_with_retry(ib: IB, account: str = "",
+                                          retries: int = 3, delay: float = 2.0) -> Dict[str, dict]:
+    """
+    权威持仓快照 + 重试（严格版语义）
+
+    背景：get_positions 在请求失败时静默返回空字典，若被用于"确认空头持仓"
+    这类决策点，会把"取数失败"误判成"无持仓"，进而误终止/误下单。
+    本函数基于 get_positions_strict（失败抛异常）做 retries 次重取：
+    - 成功（即便空字典 = 确实无持仓，是事实）→ 直接返回；
+    - 连续失败 → 抛出 PositionSnapshotError，由调用方按"快照不可用"处置（终止并要求人工核查）。
+    """
+    last_err: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        try:
+            return await get_positions_strict(ib, account)
+        except Exception as e:
+            last_err = e
+            get_logger().warning(f"⚠️ 持仓快照获取失败（第 {attempt}/{retries} 次）: {e}")
+            if attempt < retries:
+                await asyncio.sleep(delay)
+    raise PositionSnapshotError(
+        f"持仓快照连续 {retries} 次获取失败: {last_err} —— 无法区分'无持仓'与'取数失败'"
+    )
 
 
 async def verify_position_after_order(ib: IB, account: str, symbol: str,

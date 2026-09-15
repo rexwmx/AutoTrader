@@ -91,45 +91,46 @@ async def check_trading_day(ib: IB) -> Tuple[bool, str, str, str]:
         return False, "", "", ""
 
 
-def wait_until_time(target_hour: int, target_minute: int) -> None:
+def wait_until_time(target_hour: int, target_minute: int, target_second: int = 0) -> None:
     """
-    阻塞等待至指定的美东时间
+    阻塞等待至指定的美东时间（精确到秒）
 
     Args:
         target_hour: 目标小时 (0-23)
         target_minute: 目标分钟 (0-59)
+        target_second: 目标秒 (0-59)，默认为 0 秒
     """
     logger = get_logger()
     last_logged_minutes = -1  # 用于防止日志刷屏
+    target_time = datetime.time(int(target_hour), int(target_minute), int(target_second))
 
     while True:
         now_est = get_current_time_est()
         current_time = now_est.time()
-        target_time = datetime.time(target_hour, target_minute)
 
-        # 已到达或超过目标时间
+        # 已到达或超过目标时间（目标时间已过去则立即返回，支持晚启动场景）
         if current_time >= target_time:
             return
 
-        # 计算需要等待的秒数
+        # 计算需要等待的秒数（含秒级差值）
         wait_seconds = (
                 (target_time.hour - current_time.hour) * 3600 +
-                (target_time.minute - current_time.minute) * 60 -
-                current_time.second
+                (target_time.minute - current_time.minute) * 60 +
+                (target_time.second - current_time.second)
         )
 
         if wait_seconds > 0:
             remaining_minutes = wait_seconds // 60
 
-            # 只在剩余分钟数发生变化时打印日志，避免每5秒刷屏
+            # 只在剩余分钟数发生变化时打印日志，避免每秒刷屏
             if remaining_minutes != last_logged_minutes:
                 logger.info(
-                    f"⏳ 等待至 {target_hour:02d}:{target_minute:02d} 美东时间... "
+                    f"⏳ 等待至 {target_hour:02d}:{target_minute:02d}:{target_second:02d} 美东时间... "
                     f"(剩余 {remaining_minutes}分{wait_seconds % 60}秒)"
                 )
                 last_logged_minutes = remaining_minutes
 
-            # ==================== 修改点：每5秒检查一次 ====================
-            time_module.sleep(min(5, wait_seconds))
+            # ==================== 修改点：每秒轮询，保证秒级精度 ====================
+            time_module.sleep(min(1, wait_seconds))
         else:
             return

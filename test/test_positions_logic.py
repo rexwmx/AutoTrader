@@ -303,4 +303,11 @@ async def main():
     print('✅ 全部持仓逻辑回归测试通过')
 
 
+# Windows 控制台默认代码页无法输出中文/emoji，统一 UTF-8，避免测试进程崩溃
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 asyncio.run(main())

@@ -1,25 +1,30 @@
 # -*- coding: utf-8 -*-
-"""
-平仓逻辑模块 (独立平仓版 + 分段式动态平仓线)
-Sell持仓和Buy持仓独立判断、独立平仓，互不干扰
-根据峰值涨幅/跌幅动态调整平仓回撤容忍度
+"""平仓执行模块 (执行层)
+
+职责：
+- 单次平仓执行（下单、等待、部分成交处理、CSV 回写）
+- 带重试的执行（重试前复核实际持仓，防止双重平仓）
+- 收市前强制平仓循环（收敛保证）
+- 退出前 CSV 补写
+
+策略逻辑（何时平仓）已迁移至 strategy/ 包；
+本模块只负责"执行策略发出的平仓信号"以及强制平仓兜底。
 """
 import asyncio
 import datetime
-import pandas as pd
 from ib_async import IB
-from order import submit_buy_order, submit_sell_order, get_fill_price, get_filled_volume
+from order import (submit_buy_order, submit_sell_order,
+                   get_fill_price, get_filled_volume)
 from monitor import wait_for_trade_completion
 from csv_writer import update_close_data_in_csv
 from logger import get_logger
 from util import format_datetime
-# 权威持仓快照（按实例锁串行化，基于 reqPositionsAsync 返回值）
 from position import get_positions, get_positions_strict
 
 ESTIMATED_COMMISSION_RATE = 0.0035
 CLOSE_RETRY_DELAY = 10
 CLOSE_MAX_RETRIES = 1
-CLOSE_CHECK_INTERVAL = 30     # 强平循环轮间检查间隔（秒）
+CLOSE_CHECK_INTERVAL = 30
 
 
 def normalize_side(side: str) -> str:
@@ -27,65 +32,12 @@ def normalize_side(side: str) -> str:
     归一化成交方向为 'BUY'/'SELL'（大小写不敏感）。
 
     关键：IBKR TWS API 的 Execution.side 协议枚举值是 **'BOT'(买) / 'SLD'(卖)**，
-    官方文档："Specifies if the transaction was buy or sale, BOT for bought, SLD for sold."
     ib_async 解码器把协议字符串原样透传，因此与 'BUY'/'SELL' 直接比较**永远为 False**
     （9.8 事故中 ASAN 退出前补写因此瘫痪，输出"无需补写"）。
     本函数同时兼容真实协议值与语义值，供所有 side 比较使用。
     """
     s = str(side).upper()
     return {'BOT': 'BUY', 'SLD': 'SELL'}.get(s, s)
-
-
-def get_close_pct(peak_pct: float) -> float:
-    """
-    根据峰值涨幅/跌幅百分比，查表得到对应的平仓线百分比。
-
-    峰值越大（盈利越多），允许的回撤也越大，平仓线越宽松。
-
-    Args:
-        peak_pct: 峰值涨幅/跌幅百分比（正数，如 5.0 表示 5%）
-
-    Returns:
-        float: 平仓线百分比（相对于建仓价的盈利保留比例）
-               如果 peak_pct < 1 则返回 -1（不触发平仓）
-
-    对应关系表：
-        PEAK_PCT        CLOSE_PCT
-        2%-3%           1%
-        3%-4%           2%
-        4%-10%          PEAK_PCT * 50%
-        10%-15%         PEAK_PCT * 45%
-        15%-20%         PEAK_PCT * 40%
-        20%-25%         PEAK_PCT * 35%
-        25%-30%         PEAK_PCT * 30%
-        30%-60%         PEAK_PCT * 25%
-        60%-100%        PEAK_PCT * 20%
-        >100%           PEAK_PCT * 10%
-    """
-    if peak_pct < 1:
-        return -1.0  # 峰值太小，不触发平仓
-    elif peak_pct < 2:
-        return 0.65
-    elif peak_pct < 3:
-        return 1.0
-    elif peak_pct < 4:
-        return 1.5
-    elif peak_pct < 10:
-        return peak_pct * 0.50
-    elif peak_pct < 15:
-        return peak_pct * 0.45
-    elif peak_pct < 20:
-        return peak_pct * 0.40
-    elif peak_pct < 25:
-        return peak_pct * 0.35
-    elif peak_pct < 30:
-        return peak_pct * 0.30
-    elif peak_pct < 60:
-        return peak_pct * 0.25
-    elif peak_pct < 100:
-        return peak_pct * 0.20
-    else:
-        return peak_pct * 0.10
 
 
 class CloseManager:
@@ -99,150 +51,32 @@ class CloseManager:
         self.buy_csv_path = buy_csv_path
         self.logger = get_logger()
 
-        self.closed_symbols_acc1 = set()
-        self.closed_symbols_acc2 = set()
-
-        self.is_runtime_close_active = False
-        self.runtime_close_start_time = None
         # 收市前强制平仓窗口标志：窗口内不再触发新的运行时平仓，
-        # 避免运行时平仓任务与强制平仓循环并发对同一标的重复下单（过度平仓→反向残留）
+        # 避免运行时平仓任务与强制平仓循环并发对同一标的重复下单（过度平仓→反向残留）。
+        # 与策略侧的让路联动（runner.stop()）由 hedge_trade 统一控制。
         self.force_close_active = False
 
-    def start_runtime_close(self, delay_minutes: int = 2):
-        self.runtime_close_start_time = datetime.datetime.now() + datetime.timedelta(minutes=delay_minutes)
-        self.logger.info(f"⏱️ 运行时平仓监控将在 {self.runtime_close_start_time.strftime('%H:%M:%S')} 激活")
+    # ------------------------------------------------------------------
+    # 公开入口（供 StrategyRunner 调用）
+    # ------------------------------------------------------------------
+    async def run_close_signal(self, ib, account, symbol, close_action,
+                               volume, open_price, open_action, csv_path) -> bool:
+        """执行一个平仓信号（带重试+持仓复核）
 
-    def _get_entry_datetime(self, symbol: str, action: str, csv_path) -> str:
-        try:
-            df = pd.read_csv(csv_path)
-            mask = (df['code'] == symbol) & (df['action'] == action)
-            if mask.any():
-                return str(df[mask].iloc[-1]['datetime'])
-        except Exception:
-            pass
-        return "未知时间"
-
-    async def check_runtime_conditions(self, symbol: str, current_close: float,
-                                       min_close_since_entry: float,
-                                       max_close_since_entry: float):
+        返回 True = 已平仓或确认目标方向仓位已归零；
+        返回 False = 重试次数用尽仍未平完。
         """
-        独立检查账户1和账户2的平仓条件（分段式动态平仓线）
+        return await self._execute_close_with_retry(
+            ib, account, symbol, close_action, volume,
+            open_price, open_action, csv_path
+        )
 
-        - 使用权威持仓快照（reqPositionsAsync 返回值，按实例锁串行化），
-          不再使用 ib.positions() 长寿命缓存：
-          缓存的幽灵条目会对"不存在的持仓"触发平仓（真实后果是反向开仓→残留），
-          半批读取会漏掉真实持仓。
-        - 收市前强制平仓窗口内（force_close_active=True）不再触发新的运行时平仓，
-          避免与强制平仓循环并发对同一标的重复下单。
-        """
-        if self.force_close_active:
-            return
-
-        if not self.is_runtime_close_active:
-            if self.runtime_close_start_time and datetime.datetime.now() >= self.runtime_close_start_time:
-                self.is_runtime_close_active = True
-                self.logger.info("🟢 运行时平仓监控已激活")
-            else:
-                return
-
-        try:
-            snap1 = await get_positions(self.ib1, self.account1)
-            snap2 = await get_positions(self.ib2, self.account2)
-        except Exception as e:
-            self.logger.warning(f"⚠️ {symbol}: 获取持仓快照失败，跳过本次运行时平仓检查: {e}")
-            return
-        pos1 = snap1.get(symbol)
-        pos2 = snap2.get(symbol)
-
-        # ==================== 账户1 (做空) 平仓条件 ====================
-        if pos1 is not None and pos1['position'] < 0:
-            if symbol not in self.closed_symbols_acc1:
-                entry_price = float(pos1['avgCost'])
-                if entry_price > 0 and min_close_since_entry > 0:
-                    # cond1: 当前处于下跌状态（做空盈利方向）
-                    cond1 = current_close < entry_price
-
-                    if cond1:
-                        # 计算实际峰值跌幅（正数）
-                        peak_pct = (entry_price - min_close_since_entry) / entry_price * 100
-
-                        # 查表得到平仓线
-                        close_pct = get_close_pct(peak_pct)
-
-                        if close_pct >= 0:
-                            # cond2: 峰值跌幅达到 get_close_pct 的最低门槛（1%）
-                            # 修复：旧式 min < entry*(1-peak_pct/100) 中右边恒等于 min，
-                            # 化简为 min < min，永远为 False，导致运行时平仓从不触发
-                            cond2 = peak_pct >= 1.0
-
-                            # cond3: 当前价从最低点反弹，回升到平仓线以上
-                            # 平仓线 = entry_price * (1 - peak_pct + close_pct)
-                            close_line = entry_price * (1 - peak_pct / 100 + close_pct / 100)
-                            cond3 = current_close >= close_line
-
-                            if cond2 and cond3:
-                                rebound_pct = (current_close - min_close_since_entry) / min_close_since_entry * 100
-                                entry_dt = self._get_entry_datetime(symbol, 'sell', self.sell_csv_path)
-                                reason = (
-                                    f"账户1(做空)触发 | 建仓: {entry_dt} | "
-                                    f"成本{entry_price:.2f}, "
-                                    f"最低{min_close_since_entry:.2f}(跌{peak_pct:.1f}%), "
-                                    f"平仓线{close_line:.2f}(保留{close_pct:.1f}%), "
-                                    f"现价{current_close:.2f}(反弹{rebound_pct:.1f}%)"
-                                )
-                                self.logger.info(f"⚡ 触发独立平仓: {symbol} | {reason}")
-                                self.closed_symbols_acc1.add(symbol)
-                                vol = abs(int(pos1['position']))
-                                asyncio.create_task(self._execute_close_with_retry(
-                                    self.ib1, self.account1, symbol, 'buy', vol, entry_price, 'sell', self.sell_csv_path
-                                ))
-
-        # ==================== 账户2 (做多) 平仓条件 ====================
-        if pos2 is not None and pos2['position'] > 0:
-            if symbol not in self.closed_symbols_acc2:
-                entry_price = float(pos2['avgCost'])
-                if entry_price > 0 and max_close_since_entry > 0:
-                    # cond1: 当前处于上涨状态（做多盈利方向）
-                    cond1 = current_close > entry_price
-
-                    if cond1:
-                        # 计算实际峰值涨幅（正数）
-                        peak_pct = (max_close_since_entry - entry_price) / entry_price * 100
-
-                        # 查表得到平仓线
-                        close_pct = get_close_pct(peak_pct)
-
-                        if close_pct >= 0:
-                            # cond2: 峰值涨幅达到 get_close_pct 的最低门槛（1%）
-                            # 修复：旧式 max > entry*(1+peak_pct/100) 中右边恒等于 max，
-                            # 化简为 max > max，永远为 False，导致运行时平仓从不触发
-                            cond2 = peak_pct >= 1.0
-
-                            # cond3: 当前价从最高点回落，跌到平仓线以下
-                            # 平仓线 = entry_price * (1 + close_pct)
-                            close_line = entry_price * (1 + close_pct / 100)
-                            cond3 = current_close <= close_line
-
-                            if cond2 and cond3:
-                                pullback_pct = (max_close_since_entry - current_close) / max_close_since_entry * 100
-                                entry_dt = self._get_entry_datetime(symbol, 'buy', self.buy_csv_path)
-                                reason = (
-                                    f"账户2(做多)触发 | 建仓: {entry_dt} | "
-                                    f"成本{entry_price:.2f}, "
-                                    f"最高{max_close_since_entry:.2f}(涨{peak_pct:.1f}%), "
-                                    f"平仓线{close_line:.2f}(保留{close_pct:.1f}%), "
-                                    f"现价{current_close:.2f}(回撤{pullback_pct:.1f}%)"
-                                )
-                                self.logger.info(f"⚡ 触发独立平仓: {symbol} | {reason}")
-                                self.closed_symbols_acc2.add(symbol)
-                                vol = int(pos2['position'])
-                                asyncio.create_task(self._execute_close_with_retry(
-                                    self.ib2, self.account2, symbol, 'sell', vol, entry_price, 'buy', self.buy_csv_path
-                                ))
-
+    # ------------------------------------------------------------------
+    # 单次执行 + 重试
+    # ------------------------------------------------------------------
     async def _position_now(self, ib: IB, account: str, symbol: str) -> int:
         """
-        权威快照：该账户当前该标的持仓（股数，无持仓为0），禁止用长寿命缓存判断。
+        权威快照：该账户该标的持仓（股数），失败抛异常。
         使用失败严格版快照：TWS 取数失败必须向上抛出（由调用方按"未知"处理），
         绝不能被静默当成 0 持仓——那会让重试误判"已平完"而停止补单。
         """
@@ -250,9 +84,9 @@ class CloseManager:
         return int(snap.get(symbol, {'position': 0})['position'])
 
     async def _execute_close_with_retry(self, ib: IB, account: str, symbol: str, close_action: str,
-                                        volume: int, open_price: float, open_action: str, csv_path):
+                                        volume: int, open_price: float, open_action: str, csv_path) -> bool:
         """
-        带重试的平仓执行（重试前复核实际持仓，防止“已成交+重试”双重平仓）
+        带重试的平仓执行（重试前复核实际持仓，防止"已成交+重试"双重平仓）
 
         Returns:
             bool: True=已平仓或仓位确认已归零; False=重试次数用尽仍未平完
@@ -294,15 +128,15 @@ class CloseManager:
                 return True
 
         self.logger.error(f"❌ {symbol}: 平仓重试 {CLOSE_MAX_RETRIES} 次后仍失败")
+        return False
 
     async def _execute_close(self, ib: IB, symbol: str, close_action: str,
                              volume: int, open_price: float, open_action: str, csv_path) -> bool:
-        """执行单次平仓，返回是否成功"""
+        """执行单次平仓，返回是否成功（全部成交才返回 True）"""
         self.logger.info(f"🔄 {symbol}: 开始执行 {close_action} 平仓 {volume}股...")
 
-        trade = await submit_buy_order(ib, symbol, volume) if close_action == 'buy' else await submit_sell_order(ib,
-                                                                                                                 symbol,
-                                                                                                                 volume)
+        trade = await submit_buy_order(ib, symbol, volume) if close_action == 'buy' else await submit_sell_order(
+            ib, symbol, volume)
         if not trade:
             return False
 
@@ -377,6 +211,9 @@ class CloseManager:
             self.logger.warning(f"⚠️ {symbol}: 平仓完成但更新CSV失败")
         return True
 
+    # ------------------------------------------------------------------
+    # 强制平仓
+    # ------------------------------------------------------------------
     async def force_close_all(self):
         """收市前强制平仓：方向无关，清空两账户全部持仓（含反向残留/历史残留）"""
         self.logger.info("\n" + "=" * 50)
@@ -393,20 +230,20 @@ class CloseManager:
         finally:
             self.force_close_active = False
 
-    async def force_close_until_flat(self, timeout_minutes: int = 5) -> bool:
+    async def force_close_until_flat(self, timeout_minutes: int = 10) -> bool:
         """
         强制平仓循环（收敛保证版）
 
         每轮基于最新权威持仓快照，对任意方向的非零持仓提交反向平仓：
         - 标准腿（账户1空头/账户2多头）照常回写CSV平仓字段；
-        - 反向残留（账户1多头/账户2空头，通常由“已Cancel订单延迟成交 + 重试补单”
+        - 反向残留（账户1多头/账户2空头，通常由"已Cancel订单延迟成交 + 重试补单"
           双重成交造成，或前日遗留仓如EOSE）→ 平仓并记CRITICAL，不写CSV。
         如此循环，无论TWS延迟成交如何乱序，都会逐轮收敛到两账户全平。
 
         Returns:
             bool: True=全部清仓完成; False=超时仍有残留
         """
-        # 进入强制平仓窗口：运行时平仓让路，避免并发对同一标的重复下单
+        # 进入强制平仓窗口：运行时策略让路（runner.stop() 由 hedge_trade 在调用前触发）
         self.force_close_active = True
         try:
             deadline = datetime.datetime.now() + datetime.timedelta(minutes=timeout_minutes)
@@ -444,9 +281,6 @@ class CloseManager:
                     f"账户2: {_fmt(pos2) or '—'}) —— 重新提交平仓订单..."
                 )
 
-                # 重置已平仓标记（仓位仍在 = 必须可再平）
-                self.closed_symbols_acc1.clear()
-                self.closed_symbols_acc2.clear()
                 await self._force_close_positions(pos1, pos2)
                 await asyncio.sleep(CLOSE_CHECK_INTERVAL)
 
@@ -457,8 +291,6 @@ class CloseManager:
             return False
         finally:
             self.force_close_active = False
-            # 强制平仓窗口结束后，运行时平仓不再触发（临近/已过收市，只允许人工处理）
-            self.is_runtime_close_active = False
 
     @staticmethod
     def _pv(obj, key):
@@ -477,7 +309,6 @@ class CloseManager:
         for symbol, pos in pos1.items():
             position = int(self._pv(pos, 'position'))
             standard = position < 0
-            self.closed_symbols_acc1.add(symbol)
             jobs.append((f"账户1 {symbol}", self._close_position(
                 self.ib1, self.account1, symbol, position,
                 self.sell_csv_path if standard else None, 'sell', standard,
@@ -487,7 +318,6 @@ class CloseManager:
         for symbol, pos in pos2.items():
             position = int(self._pv(pos, 'position'))
             standard = position > 0
-            self.closed_symbols_acc2.add(symbol)
             jobs.append((f"账户2 {symbol}", self._close_position(
                 self.ib2, self.account2, symbol, position,
                 self.buy_csv_path if standard else None, 'buy', standard,
@@ -527,6 +357,9 @@ class CloseManager:
             open_action if standard else None, csv_path
         )
 
+    # ------------------------------------------------------------------
+    # 退出前 CSV 补写
+    # ------------------------------------------------------------------
     async def reconcile_csv_with_fills(self):
         """
         退出前 CSV 补写：从 TWS 的 fills 记录中获取实际成交数据，
@@ -641,8 +474,8 @@ class CloseManager:
                 row_vol = 0
 
             # ==================== 核心规则：成交必须完整覆盖开仓记录才允许标记已平仓 ====================
-            # 旧代码只要有任何一笔平仓成交就补写整行，部分成交也会被标记“已平仓”，
-            # 直接造成 “CSV 显示已全部平仓、账户仍有持仓” 的错账。未覆盖的行必须保留未平仓标记。
+            # 旧代码只要有任何一笔平仓成交就补写整行，部分成交也会被标记"已平仓"，
+            # 直接造成 "CSV 显示已全部平仓、账户仍有持仓" 的错账。未覆盖的行必须保留未平仓标记。
             if row_vol > 0 and total_fill < row_vol:
                 fill_vol_by_symbol[symbol] = 0
                 self.logger.critical(

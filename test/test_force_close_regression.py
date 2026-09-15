@@ -337,8 +337,10 @@ async def main():
 
     C.get_positions_strict = strict_seq
     flat = await m.force_close_until_flat(timeout_minutes=10)
+    # 说明：is_runtime_close_active 已随策略剥离移除（让路改由 StrategyRunner.active 承担），
+    # 此处只断言执行层的 force_close_active 复位。
     ok4 = (flat is True and close_log == [('D1', 'AAA', -1000)]
-           and m.force_close_active is False and m.is_runtime_close_active is False)
+           and m.force_close_active is False)
     print(f'[{"ok" if ok4 else "FAIL"}] F4 两轮收敛后判平: flat={flat}, closes={close_log}, '
           f'gate_reset={not m.force_close_active}')
     if not ok4:
@@ -471,5 +473,12 @@ async def main():
         sys.exit(1)
     print('✅ 强制平仓回归测试全部通过：部分成交不再被误判为已平仓')
 
+
+# Windows 控制台默认代码页无法输出中文/emoji，统一 UTF-8，避免测试进程崩溃
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
 
 asyncio.run(main())

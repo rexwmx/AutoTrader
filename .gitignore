@@ -1,3 +1,7 @@
 /__pycache__
-/trade_log
 /test/__pycache__
+/strategy/__pycache__
+/change_plan
+/trade_log
+/backtest/data
+/backtest/result
