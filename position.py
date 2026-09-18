@@ -7,7 +7,8 @@ import asyncio
 from pathlib import Path
 from typing import Dict, Optional
 from ib_async import IB
-from order import submit_buy_order, submit_sell_order, get_fill_price, get_filled_volume
+from order import (submit_buy_order, submit_sell_order, get_fill_price,
+                   get_filled_volume, cancel_order)
 from monitor import wait_for_trade_completion
 from csv_writer import append_trade_record
 from models import TradeRecord
@@ -176,7 +177,11 @@ async def verify_position_after_order(ib: IB, account: str, symbol: str,
 
 
 RECONCILE_MAX_ROUNDS = 3                 # 定点调平最大轮数
-RECONCILE_ROUND_SETTLE_SECONDS = 10      # 每轮开始前等待（让TWS完成持仓更新）
+RECONCILE_SETTLE_LONG_SECONDS = 10       # 每轮前 settle 等待：上一轮成交"未持仓级确认"（持仓落账未保证）
+RECONCILE_SETTLE_SHORT_SECONDS = 3       # 每轮前 settle 等待：上一轮全部持仓级确认（快照已反映成交）
+RECONCILE_ROUND_SETTLE_SECONDS = RECONCILE_SETTLE_LONG_SECONDS  # 兼容旧名
+RECONCILE_ORDER_TIMEOUT = 20             # 每笔调平单等待(秒)：20s 未成交 → 撤单 + 权威快照核实
+                                         # （原30s且不撤单：残留单延迟成交是 9/14 OKLO 84股搅动的直接推手）
 
 
 def backfill_missing_open_records(
@@ -342,11 +347,17 @@ async def reconcile_positions(
     success_count = 0
     total_adjustments = 0
     adjusted_any = False
+    # 下一轮前的 settle 等待（每轮结束后依据"持仓级确认"更新：
+    # 全部持仓级确认 → 短等待；任一缺失 → 恢复长等待）
+    next_settle = RECONCILE_SETTLE_LONG_SECONDS
 
     for round_no in range(1, RECONCILE_MAX_ROUNDS + 1):
         if round_no > 1:
             # 让 TWS 完成上一轮调平单的持仓更新
-            await asyncio.sleep(RECONCILE_ROUND_SETTLE_SECONDS)
+            if next_settle < RECONCILE_SETTLE_LONG_SECONDS:
+                logger.info(f"⏱️ 上一轮成交均已持仓级确认，settle 等待缩短为 {next_settle} 秒")
+            await asyncio.sleep(next_settle)
+            next_settle = RECONCILE_SETTLE_LONG_SECONDS
 
         positions1 = await get_positions(ib1, account1)
         positions2 = await get_positions(ib2, account2)
@@ -363,6 +374,9 @@ async def reconcile_positions(
         logger.info(f"⚠️ 第{round_no}轮: 发现 {len(adjustments)} 个持仓不一致，开始调平...")
         total_adjustments += len(adjustments)
         adjusted_any = True
+
+        # 本轮"持仓级确认"标记：全部调平单都在持仓快照中得到验证时，下一轮可用短 settle
+        round_position_confirmed = True
 
         for adj in adjustments:
 
@@ -384,19 +398,34 @@ async def reconcile_positions(
                 logger.error(f"❌ 调平订单提交失败: {symbol}")
                 continue
 
-            # 等待订单完成
-            status = await wait_for_trade_completion(trade, timeout_seconds=30)
+            # 等待订单完成（20s；未成交 → 撤单 + 权威快照核实）
+            status = await wait_for_trade_completion(trade, RECONCILE_ORDER_TIMEOUT)
 
             # ==================== 关键改进：持仓验证 ====================
-            # 无论订单状态如何，都通过实际持仓验证
+            # 无论订单状态如何，都通过实际持仓验证；只有"持仓级确认"的成交
+            # 才允许下一轮使用短 settle（9/14 OKLO 84股延迟成交搅动的教训）
+            position_seen = False
             if status == 'Filled':
                 # 订单报告成功，直接使用
                 fill_price = get_fill_price(trade)
                 fill_vol = get_filled_volume(trade)
                 verified = True
+                if action == 'buy':
+                    # Paper 账户可能"先报成交、后更新持仓"：只有持仓级看到的成交
+                    # 才视为落定，否则下一轮恢复长 settle，防止旧快照误判二次补买
+                    try:
+                        pos_chk = await verify_position_after_order(
+                            ib, account, symbol, 'buy', retries=2, delay=2.0
+                        )
+                        position_seen = bool(pos_chk['exists'])
+                    except Exception as e:
+                        logger.debug(f"🔍 {symbol}: 持仓复核异常: {e}")
+                    if not position_seen:
+                        logger.info(f"🔍 {symbol}: 订单已成交但持仓尚未落账，下一轮恢复长 settle 等待")
             else:
-                # 订单报告失败（Cancelled/Timeout），验证实际持仓
-                logger.info(f"🔍 {symbol}: 订单状态 {status}，验证实际持仓...")
+                # 订单报告未成交：先撤掉残留挂单（防止其延迟成交破坏头寸），再验证实际持仓
+                await cancel_order(ib, trade)
+                logger.info(f"🔍 {symbol}: 订单状态 {status}（已撤单），验证实际持仓...")
                 pos_info = await verify_position_after_order(
                     ib, account, symbol, action, retries=3, delay=5.0
                 )
@@ -406,14 +435,18 @@ async def reconcile_positions(
                     fill_price = pos_info['avg_cost']
                     fill_vol = pos_info['volume']
                     verified = True
+                    position_seen = True
                     logger.info(
                         f"🔄 {symbol}: 订单报告 {status}，但实际已成交！"
                         f"持仓 {fill_vol}股 @ ${fill_price:.2f}"
                     )
                 else:
                     # 确实没有持仓 → 调平失败
-                    logger.error(f"❌ 调平失败: {symbol} {action} {volume}股 (状态: {status})")
+                    logger.error(f"❌ 调平失败: {symbol} {action} {volume}股 (状态: {status}，持仓未见)")
                     verified = False
+
+            # 记录"持仓级确认"，供下一轮 settle 时长按安全级别选择
+            round_position_confirmed = round_position_confirmed and position_seen
 
             if verified:
                 success_count += 1
@@ -467,6 +500,10 @@ async def reconcile_positions(
                     ), sell_csv_path)
                     logger.info(f"📝 补写 sell.csv: {symbol} {fill_vol}股 @ ${fill_price:.2f}")
 
+
+        # 本轮成交全部持仓级确认 → 下一轮可用短 settle；否则保持长 settle（安全兜底）
+        if round_position_confirmed:
+            next_settle = RECONCILE_SETTLE_SHORT_SECONDS
 
     # ==================== 终态确认（权威快照） ====================
     positions1_final = await get_positions(ib1, account1)

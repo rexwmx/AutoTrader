@@ -44,6 +44,8 @@ class StrategyRunner:
         # 让路开关：强制平仓窗口内/结束后不再触发运行时信号
         self.active = False
         self.activate_at: Optional[datetime.datetime] = None
+        # 调平互斥开关：调平运行期间禁止策略处理bar（防止与调平单并发写同一账户/标的）
+        self._reconcile_pause = False
         # 每只标的的最早建仓时间（用于跳过建仓前的历史 bar），统一为美东 aware
         self.entry_times: dict = {}
 
@@ -108,6 +110,22 @@ class StrategyRunner:
         self.active = False
         self.logger.info("🔴 运行时策略已停用（强制平仓窗口接管）")
 
+    def pause_for_reconcile(self) -> None:
+        """调平开始：调平运行期间策略暂停处理 bar（含平仓单执行）。
+
+        背景（2026-09-14 OKLO 实例）：超时买单延迟成交导致账户2 持仓在调平窗口内
+        0→28→84 剧烈变化；若策略同时基于中间快照发出平仓单，会与调平单（补买/反向补卖）
+        交叉撮合 → 超卖/裸仓。entry_times 只保护"建仓前"，管不住"调平中"。
+        """
+        self._reconcile_pause = True
+        self.logger.info("⏸️ 策略执行暂停（调平进行中，防止与调平单并发下达）")
+
+    def resume_after_reconcile(self) -> None:
+        """调平结束：恢复策略 bar 处理"""
+        if self._reconcile_pause:
+            self._reconcile_pause = False
+            self.logger.info("▶️ 调平结束，策略执行恢复")
+
     # ------------------------------------------------------------------
     # 事件入口
     # ------------------------------------------------------------------
@@ -130,6 +148,11 @@ class StrategyRunner:
         if not self.active:
             return
         if self.activate_at and datetime.datetime.now() < self.activate_at:
+            return
+
+        # 调平运行中：跳过本根 bar（极端值追踪从下一根恢复；安全优先于抢 1 个 bar 窗口）
+        if self._reconcile_pause:
+            self.logger.info(f"⏸️ [{bar.symbol}] 调平进行中，跳过本根 bar（下一根恢复）")
             return
 
         # 建仓前的历史 bar 直接跳过（不拉持仓，省 TWS 请求）

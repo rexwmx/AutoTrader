@@ -90,6 +90,13 @@ P.submit_sell_order = None
 P.wait_for_trade_completion = None
 P.append_trade_record = lambda record, path: True
 
+
+async def fake_cancel(ib, trade):
+    return True
+
+
+P.cancel_order = fake_cancel
+
 _log = get_logger()
 records = []
 

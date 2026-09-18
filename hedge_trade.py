@@ -284,26 +284,50 @@ async def main():
     )
 
     # ============================================================
-    # 阶段7.5: 调平兜底（20秒确认窗口的残留缺口由多轮调平补齐）
+    # 流心跳看门狗（2026-09-15 事故修复）
+    # TWS↔IBKR 断连会杀死全部 1 分钟 keepUpToDate 流且恢复后不会自动重建；
+    # 看门狗在 5 分钟无 bar 事件时自动诊断（API 连接 + 全量重订阅），
+    # 回放数据只补写 CSV、不重放入策略。策略停用后（强制平仓窗口）自动静默。
+    # ============================================================
+    recorder.start_feed_watchdog(is_quiet=lambda: not runner.active)
+    logger.info("🫀 数据流心跳看门狗已启动（断流后自动巡检修复策略已就绪）")
+
+    # ============================================================
+    # 【方案B】策略激活前移到调平之前（生效时点仍是第一根bar边界 开盘+60s）
+    # 调平只是残留缺口兜底，不应占用策略就绪时间窗口；
+    # 若调平拖过边界（如 2026-09-14 三轮 64 秒），runner 自动顺延为立即生效。
+    # ============================================================
+    if open_dt:
+        runner.start(first_bar_boundary=open_dt + datetime.timedelta(seconds=60))
+    else:
+        runner.start(delay_seconds=60)
+
+    # ============================================================
+    # 阶段7.5: 调平兜底（多轮调平补齐残留缺口）
+    # 调平运行期间 strategy on_bar 被 pause 禁发平仓单，防止与调平单
+    # （补买/反向补卖）并发写同一账户/标的 → 超卖/裸仓（09-14 OKLO 型竞态）
     # ============================================================
     logger.info("\n" + "=" * 50)
     logger.info("⚖️ 阶段7.5: 持仓调平兜底 (复核确认窗口的残留缺口)")
     logger.info("=" * 50)
-    await asyncio.sleep(3)  # 预留3秒让 TWS 确认买单的底层持仓更新
-    stock_info_map = {s.code: s for s in selected_stocks}
-
-    await reconcile_positions(
-        ib1, ib2, account1, account2,
-        sell_csv_path=sell_csv_path,
-        buy_csv_path=buy_csv_path,
-        stock_info_map=stock_info_map
-    )
+    runner.pause_for_reconcile()
+    try:
+        await asyncio.sleep(3)  # 预留3秒让 TWS 确认买单的底层持仓更新
+        stock_info_map = {s.code: s for s in selected_stocks}
+        await reconcile_positions(
+            ib1, ib2, account1, account2,
+            sell_csv_path=sell_csv_path,
+            buy_csv_path=buy_csv_path,
+            stock_info_map=stock_info_map
+        )
+    finally:
+        runner.resume_after_reconcile()
 
     # ============================================================
-    # 阶段8: 对账审计与策略激活
+    # 阶段8: 对账审计与延迟成交补齐（基于调平结束后的稳定快照）
     # ============================================================
     logger.info("\n" + "=" * 50)
-    logger.info("📡 阶段8: 对账审计与策略激活")
+    logger.info("📡 阶段8: 对账审计与延迟成交补齐")
     logger.info("=" * 50)
 
     # ==================== 关键修复：基于TWS实际持仓判断 ====================
@@ -427,16 +451,8 @@ async def main():
         logger.info(f"🔁 延迟标的补齐完成: {len(late_stocks)} 只已进入监控名单")
 
     if actual_hedged_stocks:
-        # 【新时序】激活策略系统：以第一根 1 分钟 bar 的收盘边界（开盘+60s）为准，
-        # 保证激活后立即处理"第一根新 bar"事件（= 第一根 bar 收盘时刻），
-        # 不再像固定 delay=120s 那样多等约 90 秒、错过第一根 bar；
-        # 若就绪晚于边界（结算慢），runner 内部自动顺延为立即生效。
-        if open_dt:
-            first_bar_close_dt = open_dt + datetime.timedelta(seconds=60)
-            runner.start(first_bar_boundary=first_bar_close_dt)
-        else:
-            runner.start(delay_seconds=60)
-
+        # （策略激活已前移到阶段7.5之前；生效时点 = 第一根bar边界 开盘+60s，
+        #  若调平拖过边界则 runner 已自动顺延为立即生效）
         logger.info(
             f"\n✅ 所有阶段完成！\n"
             f"  实际对冲: {len(actual_hedged_stocks)} 只\n"
@@ -465,6 +481,8 @@ async def main():
                     logger.info("⏰ 到达收市前10分钟，触发强制平仓...")
                     # 【新增】先让运行时策略让路，防止并发对同一标的重复下单
                     runner.stop()
+                    # 强制平仓窗口不再需要行情驱动，停止流看门狗巡检（is_quiet 也会静默）
+                    recorder.stop_feed_watchdog()
 
                     # 多轮强制平仓：单轮不收敛（超时）立即再开下一轮，
                     # 直到清仓或达到总时限 —— 绝不带着残留仓位静默退出
