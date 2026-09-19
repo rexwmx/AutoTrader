@@ -25,6 +25,15 @@ async def connect_account(host: str, port: int,
     """
     logger = get_logger()
     ib = IB()
+    # ==================== 必须声明：TWS 以 UTC 回报时间 ====================
+    # 背景（9.14 SBET/ASST、9.16 EOSE、9.18 GNRC/RXRX/ABSI 平仓时间异常事故）：
+    # TWS/Paper 的成交回报时间是「UTC 墙钟」；ib_async 默认(TimezoneTWS='')会把 naive
+    # 时间按机器本地时区(本机=美东)解释，解码出的时刻整体偏移 4 小时(EDT)，
+    # 退出前 CSV 补写(close.py)若直接采用该时间会把平仓时间多写 8 小时。
+    # 此处显式告知 ib_async「TWS 用的是 UTC」→ execution.time 即为正确 UTC 时刻；
+    # close.py 补写时再统一转美东时间并做收到时刻交叉校验。
+    # ⚠️ 请勿删除；若日后 TWS 时区设置(TWS: 文件→设置→时间和日历)改动，须同步更新此值。
+    ib.TimezoneTWS = 'UTC'
 
     try:
         logger.info(f"正在连接 {name} ({host}:{port}, clientId={client_id})...")

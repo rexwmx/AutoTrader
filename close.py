@@ -12,6 +12,7 @@
 """
 import asyncio
 import datetime
+import pytz
 from ib_async import IB
 from order import (submit_buy_order, submit_sell_order,
                    get_fill_price, get_filled_volume)
@@ -25,6 +26,34 @@ ESTIMATED_COMMISSION_RATE = 0.0035
 CLOSE_RETRY_DELAY = 10
 CLOSE_MAX_RETRIES = 1
 CLOSE_CHECK_INTERVAL = 30
+
+# 补写时间写入 CSV 使用的时区（美东），与全系统 Bar.dt / 建仓时间同一基准
+_EST_TZ = pytz.timezone('US/Eastern')
+
+
+def _to_utc_instant(value):
+    """
+    把 IB 成交时间（各种形态）归一成 UTC 绝对时刻。
+
+    兼容形态:
+    - aware datetime   → 时刻权威，原样转 UTC 返回
+    - naive datetime   → 按「UTC 墙钟」处理（现行约定：TWS 以 UTC 报表；
+                         account.py 已设 TimezoneTWS='UTC' 保证 ib_async 按此解码）
+    - float/int epoch  → Fill.time 的收到时刻是机器时钟 epoch，按 UTC 转换
+    - 其它 / 非法      → None
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo is not None:
+            return value.astimezone(datetime.timezone.utc)
+        return value.replace(tzinfo=datetime.timezone.utc)
+    if isinstance(value, (int, float)) and value > 0:
+        try:
+            return datetime.datetime.fromtimestamp(value, tz=datetime.timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    return None
 
 
 def normalize_side(side: str) -> str:
@@ -501,9 +530,47 @@ class CloseManager:
             profit = gross_profit - commission
 
             # 使用最后一笔成交的时间
+            # ==================== 时区加固（9.14 SBET/ASST、9.16 EOSE、9.18 GNRC/RXRX/ABSI 事故） ====================
+            # 历史问题：TWS(paper) 以「UTC 墙钟字符串」回报成交时间，ib_async 默认(TimezoneTWS='')
+            # 把 naive 时间按**机器本地时区(美东)**解释后再转 UTC —— 解码出的时刻整体偏移 4h(EDT)；
+            # 旧代码直接 strftime 写入 CSV，最终记录比真实美东时间偏 **8 小时**（如 15:50:09 → 23:50:09）。
+            # 修复：
+            #   1) account.py 建连时设 ib.TimezoneTWS='UTC'（告知 ib_async TWS 回报用 UTC），
+            #      使 execution.time 成为正确时刻；
+            #   2) 此处统一转美东(_EST_TZ)再写 CSV；
+            #   3) 兜底：用「成交回报收到时刻」(fill.time，机器时钟、不受 TWS 时区设置影响) 交叉校验，
+            #      偏差 >10 分钟说明时区约定已失效 —— 改用收到时刻并记 CRITICAL，绝不把坏时间写进 CSV。
             sym_fills = close_fills_by_symbol[symbol]
-            last_fill_time = max(f.execution.time for f in sym_fills)
-            close_dt_str = last_fill_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(last_fill_time, 'strftime') else str(last_fill_time)
+
+            def _utc_key(f):
+                t = _to_utc_instant(getattr(f.execution, 'time', None))
+                return t if t is not None else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
+            last_fill = max(sym_fills, key=_utc_key)
+            exec_utc = _utc_key(last_fill)
+            recv_utc = _to_utc_instant(getattr(last_fill, 'time', None))
+
+            if recv_utc is not None:
+                drift = abs((exec_utc - recv_utc).total_seconds())
+                if drift > 600:
+                    self.logger.critical(
+                        f"🚨 {symbol}: IB 成交回报时间 {exec_utc.strftime('%Y-%m-%d %H:%M:%S UTC')} 与"
+                        f"收到时刻 {recv_utc.strftime('%Y-%m-%d %H:%M:%S UTC')} 偏差 {drift/60:.0f} 分钟 —— "
+                        f"时区约定很可能已失效（TWS 时区改动 / ib_async 解码异常）。"
+                        f"已改用收到时刻写入 CSV；请立即核对 Client Portal 成交明细!"
+                    )
+                    exec_utc = recv_utc
+            else:
+                if exec_utc.year == datetime.datetime.min.year:
+                    self.logger.error(f"⚠️ {symbol}: 成交时间无法解析 —— 回退为当前机器时钟")
+                    exec_utc = datetime.datetime.now(datetime.timezone.utc)
+                else:
+                    self.logger.warning(
+                        f"⚠️ {symbol}: 无收到时刻可用于交叉校验，直接采用 execution.time"
+                        f"（={exec_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}）"
+                    )
+
+            close_dt_str = exec_utc.astimezone(_EST_TZ).strftime('%Y-%m-%d %H:%M:%S')
 
             close_data = {
                 'close_datetime': close_dt_str,
