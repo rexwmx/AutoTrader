@@ -30,7 +30,8 @@ class StrategyRunner:
     def __init__(self, strategy: BaseStrategy,
                  ib1: IB, ib2: IB, account1: str, account2: str,
                  sell_csv_path, buy_csv_path,
-                 close_manager):
+                 close_manager,
+                 open_time: Optional[datetime.datetime] = None):
         self.strategy = strategy
         self.ib1 = ib1
         self.ib2 = ib2
@@ -40,6 +41,9 @@ class StrategyRunner:
         self.buy_csv_path = buy_csv_path
         self.close_manager = close_manager
         self.logger = get_logger()
+        # 当日开盘时间（美东 aware，整分钟）：开盘前两分钟的窗口 bar（第一分钟 bar 的
+        # dt=开盘时刻，早于开盘+20s 的建仓时刻）需放行建仓前门控，供开盘特殊策略评估
+        self.open_time = open_time
 
         # 让路开关：强制平仓窗口内/结束后不再触发运行时信号
         self.active = False
@@ -127,6 +131,21 @@ class StrategyRunner:
             self.logger.info("▶️ 调平结束，策略执行恢复")
 
     # ------------------------------------------------------------------
+    # 开盘窗口判定
+    # ------------------------------------------------------------------
+    def _in_open_window(self, bar: Bar) -> bool:
+        """bar 是否落在当日开盘前两分钟窗口内 [open, open+2min)（美东 aware 比较）"""
+        if self.open_time is None:
+            return False
+        try:
+            t = self._to_est(bar.dt)
+            o = self._to_est(self.open_time)
+        except Exception:
+            return False
+        delta = (t - o).total_seconds()
+        return 0 <= delta < 120
+
+    # ------------------------------------------------------------------
     # 事件入口
     # ------------------------------------------------------------------
     def on_entry(self, symbol: str, account: str,
@@ -156,9 +175,17 @@ class StrategyRunner:
             return
 
         # 建仓前的历史 bar 直接跳过（不拉持仓，省 TWS 请求）
+        # 例外：开盘前两分钟窗口内的 bar —— 第一分钟 bar 的 dt（=开盘时刻）天然早于
+        # 开盘+20s 的建仓时刻，若按旧门控会被丢弃，而开盘特殊策略恰恰需要这第一分钟数据
         et = self.entry_times.get(bar.symbol)
         if et is None or bar.dt <= et:
-            return
+            if self._in_open_window(bar):
+                self.logger.debug(
+                    f"🪟 [{bar.symbol}] bar dt={bar.dt.strftime('%H:%M:%S')} 落在开盘前两分钟窗口"
+                    f"（建仓前门控例外放行，供开盘特殊策略评估）"
+                )
+            else:
+                return
 
         # 1. 拉取权威持仓快照
         try:

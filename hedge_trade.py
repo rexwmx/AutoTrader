@@ -39,7 +39,7 @@ from realtime import RealtimeDataRecorder
 from close import CloseManager  # 新增导入
 
 # 【新增】策略系统
-from strategy import DynamicTPStrategy
+from strategy import DynamicTPStrategy, OpenWindowStrategy
 from strategy_runner import StrategyRunner
 
 
@@ -110,6 +110,30 @@ async def main():
         ib1.disconnect()
         ib2.disconnect()
         return
+
+    # ---- 从 TWS 返回的开盘时间推导 open_dt（美东 aware），供阶段5.5（开盘前两分钟特殊策略）
+    #      与阶段6（预挂单/确认/激活时序）共用 ----
+    open_dt = None
+    if open_time:
+        try:
+            open_dt = get_current_time_est().replace(
+                hour=int(open_time.split(':')[0]),
+                minute=int(open_time.split(':')[1]),
+                second=0, microsecond=0
+            )
+            logger.info(
+                f"🕗 开盘时间(TWS): {open_time} 美东 | "
+                f"预报送: {open_dt - datetime.timedelta(seconds=60)} | "
+                f"确认: {open_dt + datetime.timedelta(seconds=20)} | "
+                f"开盘前两分钟特殊策略窗口: {open_dt.strftime('%H:%M:%S')} ~ "
+                f"{(open_dt + datetime.timedelta(seconds=120)).strftime('%H:%M:%S')} | "
+                f"策略激活边界: {open_dt + datetime.timedelta(seconds=60)}"
+            )
+        except Exception as e:
+            logger.warning(
+                f"⚠️ 解析开盘时间失败: {e} —— 按「立即执行 + 提交+20s确认」兜底；"
+                f"开盘前两分钟特殊策略退化为 bar 序判定模式"
+            )
 
     # ============================================================
     # 阶段4: 数据库操作
@@ -185,7 +209,10 @@ async def main():
     # 策略 = 决策者（输入 bar + 持仓，输出信号，不碰 IB/CSV/全局变量）
     # Runner = 翻译官（拉持仓、调策略、执行信号、回传结果）
     # CloseManager = 执行者（下单、重试、CSV 回写、强制平仓）
-    strategy = DynamicTPStrategy()   # 具体策略，可替换（换策略只改这一行）
+    # inner = 原有分段动态止盈策略；outer = 开盘前两分钟特殊策略
+    # （命中 7 种情况之一 → 由 outer 定案：立即平仓 / 不操作；未命中 → inner 照常接管）
+    open_window_inner = DynamicTPStrategy()
+    strategy = OpenWindowStrategy(open_window_inner, open_time=open_dt)
     close_manager = CloseManager(
         ib1, ib2, account1, account2,
         sell_csv_path, buy_csv_path
@@ -195,8 +222,9 @@ async def main():
         ib1=ib1, ib2=ib2, account1=account1, account2=account2,
         sell_csv_path=sell_csv_path, buy_csv_path=buy_csv_path,
         close_manager=close_manager,
+        open_time=open_dt,
     )
-    logger.info(f"🧠 策略: {strategy.__class__.__name__}")
+    logger.info(f"🧠 策略: {strategy.__class__.__name__} ⊃ {open_window_inner.__class__.__name__}")
 
     # ============================================================
     # 阶段6: 执行对冲交易（优化时序：盘前预挂单 + 开盘确认 + 双通道并发）
@@ -205,26 +233,10 @@ async def main():
     logger.info("💱 阶段6: 执行对冲交易 (开盘-60s 预挂单 / 开盘+20s 确认 / 双通道并发)")
     logger.info("=" * 50)
 
-    # ---- 从 TWS 返回的开盘时间推导三个关键点（不硬编码 09:29 / 09:30:20）----
+    # ---- 三个关键时点（不硬编码 09:29 / 09:30:20；open_dt 已在阶段3后推导）----
     # 预报送 = 开盘-60s（盘前空闲窗口，TWS 置 PreSubmitted 排队）
     # 确认定仓 = max(开盘+20s, 提交+20s)（程序晚启动时按提交时间顺延）
     # 策略激活 = 开盘+60s（第一根 1 分钟 bar 的收盘边界）
-    open_dt = None
-    if open_time:
-        try:
-            open_dt = get_current_time_est().replace(
-                hour=int(open_time.split(':')[0]),
-                minute=int(open_time.split(':')[1]),
-                second=0, microsecond=0
-            )
-            logger.info(
-                f"🕗 开盘时间(TWS): {open_time} 美东 | "
-                f"预报送: {open_dt - datetime.timedelta(seconds=60)} | "
-                f"确认: {open_dt + datetime.timedelta(seconds=20)} | "
-                f"策略激活边界: {open_dt + datetime.timedelta(seconds=60)}"
-            )
-        except Exception as e:
-            logger.warning(f"⚠️ 解析开盘时间失败: {e}，按「立即执行 + 提交+20s确认」兜底")
 
     # ---- 6.1 在 开盘-60s 预报送卖空订单（开盘钟声自动送入交易所撮合）----
     if open_dt:
@@ -459,15 +471,15 @@ async def main():
             f"  股票: {[s.code for s in actual_hedged_stocks]}\n"
             f"  1分钟实时数据流已在开盘第一分钟内接入；\n"
             f"  程序将持续运行，监控运行时平仓条件...\n"
-            f"  收市前10分钟将自动触发强制平仓。"
+            f"  收市前5分钟将自动触发强制平仓。"
         )
 
-        # 计算强制平仓时间（收市前10分钟；与"✅ 所有阶段完成"日志的"收市前10分钟"一致）
+        # 计算强制平仓时间（收市前5分钟；与"✅ 所有阶段完成"日志的"收市前5分钟"一致）
         try:
             close_hour, close_minute = map(int, close_time.split(':'))
             now_est = get_current_time_est()
             close_dt = now_est.replace(hour=close_hour, minute=close_minute, second=0, microsecond=0)
-            force_close_dt = close_dt - datetime.timedelta(minutes=10)
+            force_close_dt = close_dt - datetime.timedelta(minutes=5)
             logger.info(f"⏰ 强制平仓触发时间设定为: {force_close_dt.strftime('%H:%M:%S')} 美东时间")
         except Exception as e:
             logger.error(f"❌ 解析收市时间失败: {e}")
@@ -478,7 +490,7 @@ async def main():
             while True:
                 now_est = get_current_time_est()
                 if force_close_dt and now_est >= force_close_dt:
-                    logger.info("⏰ 到达收市前10分钟，触发强制平仓...")
+                    logger.info("⏰ 到达收市前5分钟，触发强制平仓...")
                     # 【新增】先让运行时策略让路，防止并发对同一标的重复下单
                     runner.stop()
                     # 强制平仓窗口不再需要行情驱动，停止流看门狗巡检（is_quiet 也会静默）
