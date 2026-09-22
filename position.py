@@ -189,6 +189,7 @@ def backfill_missing_open_records(
         positions2: Dict[str, dict],
         sell_csv_path=None, buy_csv_path=None,
         stock_info_map=None,
+        trade_store=None,
 ) -> None:
     """
     CSV开仓记录对账补写（终态持仓 → CSV）
@@ -205,6 +206,60 @@ def backfill_missing_open_records(
     """
     logger = get_logger()
 
+    # ==================== 事件流路径（trade_store 可用） ====================
+    # 判重口径（2026-09-21 KEEL 事故修正）：不能只看"是否曾有开仓事件"——
+    # KEEL 曾有 lot（调平补买 240），但该 lot 已被超额卖出平掉，而账户里仍留着
+    # 240 股延迟成交的持仓（无账）。正确口径：补「实际持仓 − 账上未平批次」的差额。
+    if trade_store is not None:
+        for symbol, pos1 in positions1.items():
+            if pos1['position'] >= 0:
+                continue
+            actual = abs(int(pos1['position']))
+            booked = sum(int(l['remaining']) for l in trade_store.get_open_lots('account1', symbol))
+            gap = max(0, actual - booked)
+            if gap <= 0:
+                continue
+            price = float(pos1['avgCost'])
+            exchange, industry = ('', '')
+            if stock_info_map and symbol in stock_info_map:
+                exchange, industry = stock_info_map[symbol].exchange, stock_info_map[symbol].industry
+            trade_store.append_open(
+                account='account1', symbol=symbol, price=price, volume=gap,
+                exchange=exchange, industry=industry,
+                event_datetime=datetime.datetime.now(),
+                strategy='reconcile', reason='终态对账: 开仓记录缺失差额补写'
+            )
+            logger.critical(
+                f"🧾 开仓记录缺失补写 (account1): {symbol} {gap}股 @ ${price:.2f} "
+                f"（来源: 账户1终态持仓快照 avgCost {actual}股 − 账上未平批次 {booked}股；"
+                f"建仓阶段该单曾被误判为未成交或延迟成交落账）"
+            )
+        for symbol, pos2 in positions2.items():
+            if pos2['position'] <= 0:
+                continue
+            actual = int(pos2['position'])
+            booked = sum(int(l['remaining']) for l in trade_store.get_open_lots('account2', symbol))
+            gap = max(0, actual - booked)
+            if gap <= 0:
+                continue
+            price = float(pos2['avgCost'])
+            exchange, industry = ('', '')
+            if stock_info_map and symbol in stock_info_map:
+                exchange, industry = stock_info_map[symbol].exchange, stock_info_map[symbol].industry
+            trade_store.append_open(
+                account='account2', symbol=symbol, price=price, volume=gap,
+                exchange=exchange, industry=industry,
+                event_datetime=datetime.datetime.now(),
+                strategy='reconcile', reason='终态对账: 开仓记录缺失差额补写'
+            )
+            logger.critical(
+                f"🧾 开仓记录缺失补写 (account2): {symbol} {gap}股 @ ${price:.2f} "
+                f"（来源: 账户2终态持仓快照 avgCost {actual}股 − 账上未平批次 {booked}股；"
+                f"建仓阶段该单曾被误判为未成交或延迟成交落账）"
+            )
+        return
+
+    # ==================== 旧 CSV 兜底路径（trade_store 不可用） ====================
     def _open_row_codes(path: Path, action: str) -> set:
         if not path or not Path(path).exists():
             return set()
@@ -328,7 +383,8 @@ async def reconcile_positions(
         ib1: IB, ib2: IB,
         account1: str, account2: str,
         sell_csv_path=None, buy_csv_path=None,
-        stock_info_map=None
+        stock_info_map=None,
+        trade_store=None
 ) -> None:
     """
     调平两个账户的持仓
@@ -452,16 +508,63 @@ async def reconcile_positions(
                 success_count += 1
                 logger.info(f"✅ 调平成功: {symbol} {action} {fill_vol}股 @ ${fill_price:.2f}")
 
-                # ==================== 补写CSV ====================
-                now_str = format_datetime(datetime.datetime.now())
-                fill_cost = fill_price * fill_vol
-
-                # 获取股票信息
+                # ==================== 账本写入 ====================
                 exchange = ''
                 industry = ''
                 if stock_info_map and symbol in stock_info_map:
                     exchange = stock_info_map[symbol].exchange
                     industry = stock_info_map[symbol].industry
+
+                # ---------------- 事件流路径（trade_store 可用） ----------------
+                if trade_store is not None:
+                    if action == 'buy':
+                        # 账户2 补买 = 加仓（新 lot）；
+                        # 若账户1 空头腿从未有开仓事件 → 先按账户1 均价补开仓记录，再记账户2 加仓
+                        if not trade_store.has_open_events('account1', symbol):
+                            ref_price = float(adj.get('sell_price') or 0)
+                            if ref_price > 0:
+                                trade_store.append_open(
+                                    account='account1', symbol=symbol, price=ref_price, volume=fill_vol,
+                                    exchange=exchange, industry=industry,
+                                    event_datetime=datetime.datetime.now(),
+                                    strategy='reconcile', reason='调平补买: 开仓记录缺失补写'
+                                )
+                                logger.critical(
+                                    f"🧾 补写 account1 开仓记录(调平): {symbol} {fill_vol}股 @ ${ref_price:.2f}"
+                                )
+                        trade_store.append_open(
+                            account='account2', symbol=symbol, price=fill_price, volume=fill_vol,
+                            exchange=exchange, industry=industry,
+                            event_datetime=datetime.datetime.now(),
+                            strategy='reconcile', reason=adj.get('reason', '') or '调平补买'
+                        )
+                        logger.info(f"📝 事件流(account2): 调平补买 {symbol} {fill_vol}股 @ ${fill_price:.2f}")
+                    else:
+                        # 账户2 卖出 = 平自己的多头批次（平仓事件，绝不能记为开仓！）
+                        if not trade_store.get_open_lots('account2', symbol):
+                            ref_price = float(adj.get('buy_price') or 0) or fill_price
+                            trade_store.append_open(
+                                account='account2', symbol=symbol, price=ref_price, volume=fill_vol,
+                                exchange=exchange, industry=industry,
+                                event_datetime=datetime.datetime.now(),
+                                strategy='reconcile', reason='调平卖出: 开仓记录缺失补写'
+                            )
+                            logger.critical(
+                                f"🧾 补写 account2 开仓记录(调平卖出): {symbol} {fill_vol}股 @ ${ref_price:.2f}"
+                            )
+                        trade_store.append_close(
+                            account='account2', symbol=symbol, close_action='sell',
+                            volume=fill_vol, price=fill_price,
+                            event_datetime=datetime.datetime.now(),
+                            strategy='reconcile', reason=adj.get('reason', '') or '调平卖出',
+                            reconcile=True
+                        )
+                        logger.info(f"📝 事件流(account2): 调平卖出 {symbol} {fill_vol}股 @ ${fill_price:.2f}")
+                    continue
+
+                # ---------------- 旧 CSV 兜底路径（trade_store 不可用） ----------------
+                now_str = format_datetime(datetime.datetime.now())
+                fill_cost = fill_price * fill_vol
 
                 if action == 'buy' and buy_csv_path:
                     # 补买成功 → 写入 buy.csv
@@ -514,7 +617,8 @@ async def reconcile_positions(
     # （仅当传入 CSV 路径时生效；路径为 None 则安全跳过）
     backfill_missing_open_records(
         positions1_final, positions2_final,
-        sell_csv_path, buy_csv_path, stock_info_map
+        sell_csv_path, buy_csv_path, stock_info_map,
+        trade_store
     )
 
     remaining = _compute_adjustments(positions1_final, positions2_final, ib2, account2)

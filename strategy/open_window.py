@@ -328,4 +328,5 @@ class OpenWindowStrategy(BaseStrategy):
             symbol=bar.symbol, account=account,
             side=side, volume=volume, open_action=open_action,
             reason=f"{who} 开盘前两分钟特殊策略 | {detail}",
+            strategy='open_window',
         )

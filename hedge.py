@@ -123,6 +123,7 @@ async def confirm_short_positions(
         submitted_trades: List[Tuple[StockInfo, Trade]],
         sell_csv_path: Path, runner=None,
         settle_seconds: float = 2.0,
+        trade_store=None,
 ) -> Tuple[List[StockInfo], Dict[str, dict]]:
     """
     阶段 6.2: 确认空头持仓 (max(开盘+20s, 提交+20s) 调用)
@@ -131,7 +132,9 @@ async def confirm_short_positions(
        （替代串行 15×0.5s 撤单；锁定账户1空头头寸，杜绝开盘后延迟成交敞口）
     2) 权威持仓快照确认空头：严格版+重试 3 次，失败抛 PositionSnapshotError
        （避免静默空字典把"取数失败"误判成"无持仓"）
-    3) 按快照写入 sell.csv 并登记 runner（入场价 = 账户1 avgCost，权威成交均价）
+    3) 按快照写账本并登记 runner（入场价 = 账户1 avgCost，权威成交均价）
+       - trade_store 可用 → 事件流 account1/{symbol}.csv 记 OPEN 事件；
+       - 否则 → 兜底旧 sell.csv append_trade_record。
 
     Returns:
         (确认定仓股票列表, 账户1持仓快照)  —— 快照供阶段6.3买入股数直接复用，避免二次取数
@@ -176,11 +179,20 @@ async def confirm_short_positions(
         vol = abs(int(p['position']))
         cost = float(p['avgCost'])
         confirmed_stocks.append(stock)
-        append_trade_record(TradeRecord(
-            datetime=now_str, code=symbol, exchange=stock.exchange,
-            industry=stock.industry, action='sell', entry_price=cost,
-            vol=vol, total_cost=cost * vol, fund_used=cost * vol
-        ), sell_csv_path)
+        # ==================== 账本写入：事件流优先，旧 CSV 兜底 ====================
+        if trade_store is not None:
+            trade_store.append_open(
+                account='account1', symbol=symbol, price=cost, volume=vol,
+                exchange=stock.exchange, industry=stock.industry,
+                event_datetime=datetime.datetime.now(),
+                strategy='hedge', reason='盘前预挂单成交确认'
+            )
+        else:
+            append_trade_record(TradeRecord(
+                datetime=now_str, code=symbol, exchange=stock.exchange,
+                industry=stock.industry, action='sell', entry_price=cost,
+                vol=vol, total_cost=cost * vol, fund_used=cost * vol
+            ), sell_csv_path)
         if runner is not None:
             try:
                 runner.on_entry(symbol, 'account1', cost, vol, datetime.datetime.now())
@@ -195,6 +207,7 @@ async def confirm_short_positions(
 async def execute_hedge_buys(
         ib2: IB, account2: str, target_stocks: List[StockInfo],
         positions1: Dict[str, dict], buy_csv_path: Path, runner=None,
+        trade_store=None,
 ) -> None:
     """
     阶段 6.3: 账户2并发多头买入对冲 (与 1 分钟数据订阅并行执行)
@@ -237,13 +250,22 @@ async def execute_hedge_buys(
                         f"持仓 {fill_vol}股 @ ${fill_price:.2f}")
 
             if status == 'Filled' and fill_vol > 0:
-                now_str = format_datetime(datetime.datetime.now())
                 cost = fill_price * fill_vol
-                append_trade_record(TradeRecord(
-                    datetime=now_str, code=symbol, exchange=stock.exchange,
-                    industry=stock.industry, action='buy', entry_price=fill_price,
-                    vol=fill_vol, total_cost=cost, fund_used=cost
-                ), buy_csv_path)
+                # ==================== 账本写入：事件流优先，旧 CSV 兜底 ====================
+                if trade_store is not None:
+                    trade_store.append_open(
+                        account='account2', symbol=symbol, price=fill_price, volume=fill_vol,
+                        exchange=stock.exchange, industry=stock.industry,
+                        event_datetime=datetime.datetime.now(),
+                        strategy='hedge', reason='对冲买入'
+                    )
+                else:
+                    append_trade_record(TradeRecord(
+                        datetime=format_datetime(datetime.datetime.now()),
+                        code=symbol, exchange=stock.exchange,
+                        industry=stock.industry, action='buy', entry_price=fill_price,
+                        vol=fill_vol, total_cost=cost, fund_used=cost
+                    ), buy_csv_path)
                 if runner is not None:
                     try:
                         runner.on_entry(symbol, 'account2', fill_price, fill_vol,

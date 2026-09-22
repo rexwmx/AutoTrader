@@ -48,8 +48,11 @@ class CloseSignal:
 
     只描述"做什么"，不管"怎么做"。
     - side：'buy' 平空，'sell' 平多
-    - open_action：用于 CSV 匹配（做空腿对应 'sell'，做多腿对应 'buy'）
+    - open_action：用于账本匹配（做空腿对应 'sell'，做多腿对应 'buy'）
     - reason：审计日志，框架直接打日志
+    - strategy：来源策略标识（dynamic_tp / open_window 等），纯审计字段，
+      写入事件流 strategy 列；为空时执行层按平仓上下文补默认值
+    - target_lot_id：指定要平的批次（lot）；为空 → 存储层按 FIFO 自动分配
     """
     symbol: str
     account: str        # 'account1' | 'account2'
@@ -57,6 +60,8 @@ class CloseSignal:
     volume: int
     open_action: str    # 'sell' | 'buy'
     reason: str
+    strategy: str = ''
+    target_lot_id: str = ''
 
 
 class BaseStrategy(ABC):

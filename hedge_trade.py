@@ -17,7 +17,8 @@ from config import (
     TWS_HOST, ACCOUNT1_PORT, ACCOUNT1_CLIENT_ID,
     ACCOUNT2_PORT, ACCOUNT2_CLIENT_ID, DB_URL, BASE_RUNTIME_DIR,
     MINUTE_DATA_DIR, LOG_FILE_NAME, SELECTED_STOCKS_FILE,
-    SELL_RECORDS_FILE, BUY_RECORDS_FILE
+    SELL_RECORDS_FILE, BUY_RECORDS_FILE,
+    ACCOUNT1_DIR, ACCOUNT2_DIR
 )
 from constants import SELECTION_COUNT, BATCH_SIZE
 
@@ -30,7 +31,8 @@ from database import (
     get_previous_trade_date, fetch_stock_data, check_data_availability
 )
 from selector import select_stocks
-from csv_writer import write_selected_stocks, init_trade_csv
+from csv_writer import write_selected_stocks
+from trade_store import TradeStore
 from hedge import (
     pre_submit_sell_orders, confirm_short_positions, execute_hedge_buys,
 )
@@ -61,8 +63,8 @@ async def main():
     # 1.2 立即初始化日志系统 (确保后续所有错误都能写入文件)
     logger = setup_logging(runtime_dir, LOG_FILE_NAME)
 
-    # 1.3 创建子目录
-    subdirs = create_subdirs(runtime_dir, [MINUTE_DATA_DIR])
+    # 1.3 创建子目录（含事件流明细目录 account1/account2）
+    subdirs = create_subdirs(runtime_dir, [MINUTE_DATA_DIR, ACCOUNT1_DIR, ACCOUNT2_DIR])
     minute_dir = subdirs[MINUTE_DATA_DIR]
 
     logger.info("=" * 70)
@@ -75,9 +77,11 @@ async def main():
     sell_csv_path = runtime_dir / SELL_RECORDS_FILE
     buy_csv_path = runtime_dir / BUY_RECORDS_FILE
 
-    # 1.5 初始化交易记录CSV文件
-    init_trade_csv(sell_csv_path)
-    init_trade_csv(buy_csv_path)
+    # 1.5 初始化交易数据存储（事件流明细 account1/account2 + 日汇总 sell.csv/buy.csv 表头）
+    trade_store = TradeStore(runtime_dir)
+    trade_store.init_summary_files()
+    logger.info(f"📁 交易数据存储已初始化 | 明细: {runtime_dir / ACCOUNT1_DIR}, {runtime_dir / ACCOUNT2_DIR} | "
+                f"汇总: sell.csv (account1) / buy.csv (account2)")
 
     # ============================================================
     # 阶段2: 连接IBKR账户
@@ -213,9 +217,12 @@ async def main():
     # （命中 7 种情况之一 → 由 outer 定案：立即平仓 / 不操作；未命中 → inner 照常接管）
     open_window_inner = DynamicTPStrategy()
     strategy = OpenWindowStrategy(open_window_inner, open_time=open_dt)
+    # trade_store：事件流账本（account1/account2/{symbol}.csv + sell.csv/buy.csv 汇总）；
+    # None 时 CloseManager 自动退化为旧 CSV 回写路径（兜底）
     close_manager = CloseManager(
         ib1, ib2, account1, account2,
-        sell_csv_path, buy_csv_path
+        sell_csv_path, buy_csv_path,
+        trade_store=trade_store
     )
     runner = StrategyRunner(
         strategy=strategy,
@@ -267,7 +274,8 @@ async def main():
 
     try:
         confirmed_stocks, pos1_snap = await confirm_short_positions(
-            ib1, account1, submitted_trades, sell_csv_path, runner=runner
+            ib1, account1, submitted_trades, sell_csv_path, runner=runner,
+            trade_store=trade_store
         )
     except PositionSnapshotError as e:
         logger.critical(f"❌ 权威持仓快照获取失败: {e} —— 拒绝把取数失败误判为'无持仓'，程序终止，请人工核查两账户")
@@ -291,7 +299,7 @@ async def main():
     recorder = RealtimeDataRecorder(ib1, minute_dir, runner)
     await asyncio.gather(
         execute_hedge_buys(ib2, account2, confirmed_stocks, pos1_snap,
-                           buy_csv_path, runner=runner),
+                           buy_csv_path, runner=runner, trade_store=trade_store),
         recorder.subscribe_all(confirmed_stocks),
     )
 
@@ -330,7 +338,8 @@ async def main():
             ib1, ib2, account1, account2,
             sell_csv_path=sell_csv_path,
             buy_csv_path=buy_csv_path,
-            stock_info_map=stock_info_map
+            stock_info_map=stock_info_map,
+            trade_store=trade_store
         )
     finally:
         runner.resume_after_reconcile()
@@ -372,31 +381,20 @@ async def main():
         f"实际对冲={len(actual_hedged_symbols)}只"
     )
 
-    # ==================== 对账审计：CSV开仓记录 vs 实际对冲名单（双向） ====================
-    # 修复 9.8 PL 事故根因：旧版只用"两CSV并集 - 实际对冲名单"的子集检查，
-    # "单边缺行"（PL 在 sell.csv 有、buy.csv 无，但两账户都持仓）会被并集掩盖 → 假通过。
-    # 现改为三向核对：单边缺失 / CSV有而TWS无 / TWS有而CSV两边都无。
+    # ==================== 对账审计：账本开仓记录 vs 实际对冲名单（双向） ====================
+    # 修复 9.8 PL 事故根因：旧版只用"两侧并集 - 实际对冲名单"的子集检查，
+    # "单边缺行"会被并集掩盖 → 假通过。三向核对：单边缺失 / 账本有而TWS无 / TWS有而账本两边都无。
+    # （事件流账本下：开仓记录 = account1/account2 明细中存在未平完批次 remaining>0 的股票）
     try:
-        import pandas as pd
-
-        def _unclosed_open_codes(path, action):
-            _df = pd.read_csv(path)
-            if _df.empty:
-                return set()
-            _empty = (_df['close_datetime'].isna()
-                      | (_df['close_datetime'].astype(str).str.strip() == '')
-                      | (_df['close_datetime'].astype(str).str.lower() == 'nan'))
-            return set(_df.loc[(_df['action'] == action) & _empty, 'code'])
-
-        sell_open = _unclosed_open_codes(sell_csv_path, 'sell')
-        buy_open = _unclosed_open_codes(buy_csv_path, 'buy')
+        sell_open = trade_store.open_codes('account1')
+        buy_open = trade_store.open_codes('account2')
 
         # 1) 单边缺失：一边有开仓、另一边没有（对冲开仓本应双边对称，出现即记账错误）
         only_sell = sorted(sell_open - buy_open)
         only_buy = sorted(buy_open - sell_open)
-        # 2) CSV 有开仓但两账户无此对冲持仓（裸露风险，且不会进入1分钟监控名单）
+        # 2) 账本有开仓但两账户无此对冲持仓（裸露风险，且不会进入1分钟监控名单）
         missing_hedge = sorted((sell_open | buy_open) - actual_hedged_symbols)
-        # 3) TWS 有对冲持仓但 CSV 两边都无开仓记录（正常应已被调平阶段补写，出现即补写失败）
+        # 3) TWS 有对冲持仓但账本两边都无开仓记录（正常应已被调平阶段补写，出现即补写失败）
         no_csv = sorted(actual_hedged_symbols - (sell_open | buy_open))
 
         if only_sell or only_buy or missing_hedge or no_csv:
@@ -406,16 +404,16 @@ async def main():
             if only_buy:
                 _parts.append(f"buy侧有开仓但sell侧缺失: {only_buy}")
             if missing_hedge:
-                _parts.append(f"CSV有开仓但不在两账户实际对冲名单: {missing_hedge}")
+                _parts.append(f"账本有开仓但不在两账户实际对冲名单: {missing_hedge}")
             if no_csv:
-                _parts.append(f"TWS有对冲持仓但两侧CSV均无开仓记录: {no_csv}")
+                _parts.append(f"TWS有对冲持仓但两侧账本均无开仓记录: {no_csv}")
             logger.critical(
                 "🚨 开仓对账发现缺口: " + "; ".join(_parts)
-                + " —— CSV账目不完整，请人工核对TWS持仓与两侧CSV开仓记录"
+                + " —— 账本记录不完整，请人工核对TWS持仓与两账户事件流开仓记录"
             )
         else:
             logger.info(
-                "✅ 开仓对账通过: sell/buy 两侧开仓清单相互一致，"
+                "✅ 开仓对账通过: account1/account2 两侧开仓清单相互一致，"
                 "且与两账户实际对冲名单双向吻合"
             )
     except Exception as e:
@@ -445,16 +443,47 @@ async def main():
                 ))
         await recorder.subscribe_all(late_stocks)
         late_entry_dt = datetime.datetime.now()
+
+        def _book_late_leg(account: str, posd: dict, stk):
+            """延迟成交持仓的账本补写 —— 只补「实际持仓 − 账上未平批次」的差额（幂等）
+
+            2026-09-21 事故：调平阶段已补写过 INFQ/MSTR 的开仓批次，
+            此处又按全量补记一次 → 两侧各多出一整批重复 lot（open_vol 12/146），
+            15:55 强平/退出回填把重复批次与实际成交轧账，佣金和盈亏被双倍计入。
+            判重口径必须是「数量差额」而非「是否有过开仓记录」。
+            """
+            if trade_store is None or not posd:
+                return
+            actual = abs(int(posd['position']))
+            if actual <= 0:
+                return
+            booked = sum(int(l['remaining']) for l in trade_store.get_open_lots(account, stk.code))
+            gap = max(0, actual - booked)
+            if gap > 0:
+                trade_store.append_open(
+                    account=account, symbol=stk.code, price=float(posd['avgCost']),
+                    volume=gap,
+                    exchange=stk.exchange, industry=stk.industry,
+                    event_datetime=late_entry_dt,
+                    strategy='hedge', reason='延迟成交补写(差额)'
+                )
+                logger.info(f"🧾 {stk.code}: {account} 延迟成交差额补记 {gap}股 @ ${float(posd['avgCost']):.4f}")
+            else:
+                logger.info(f"ℹ️ {stk.code}: {account} 延迟成交席位 {actual}股 已全部入账"
+                            f"（未平批次 {booked}股），跳过补记防止重复记账")
+
         for stk in late_stocks:
             p1 = pos1_all.get(stk.code, {})
             p2 = pos2_all.get(stk.code, {})
             if p1 and p1['position'] < 0:
+                _book_late_leg('account1', p1, stk)  # 账本补写：延迟落账的空头批（差额幂等）
                 try:
                     runner.on_entry(stk.code, 'account1',
                                     float(p1['avgCost']), abs(int(p1['position'])), late_entry_dt)
                 except Exception as e:
                     logger.warning(f"⚠️ {stk.code}: 登记策略(account1,延迟)失败: {e}")
             if p2 and p2['position'] > 0:
+                _book_late_leg('account2', p2, stk)  # 账本补写：延迟落账的对冲多批（差额幂等）
                 try:
                     runner.on_entry(stk.code, 'account2',
                                     float(p2['avgCost']), int(p2['position']), late_entry_dt)

@@ -13,6 +13,7 @@
 import asyncio
 import datetime
 import pytz
+from pathlib import Path
 from ib_async import IB
 from order import (submit_buy_order, submit_sell_order,
                    get_fill_price, get_filled_volume)
@@ -71,13 +72,17 @@ def normalize_side(side: str) -> str:
 
 class CloseManager:
     def __init__(self, ib1: IB, ib2: IB, account1: str, account2: str,
-                 sell_csv_path, buy_csv_path):
+                 sell_csv_path, buy_csv_path,
+                 trade_store=None):
         self.ib1 = ib1
         self.ib2 = ib2
         self.account1 = account1
         self.account2 = account2
         self.sell_csv_path = sell_csv_path
         self.buy_csv_path = buy_csv_path
+        # 事件流存储（account1/account2/{symbol}.csv + sell.csv/buy.csv 汇总）；
+        # None 时全部退化为旧 CSV 路径（兼容测试与兜底场景）
+        self.trade_store = trade_store
         self.logger = get_logger()
 
         # 收市前强制平仓窗口标志：窗口内不再触发新的运行时平仓，
@@ -89,15 +94,23 @@ class CloseManager:
     # 公开入口（供 StrategyRunner 调用）
     # ------------------------------------------------------------------
     async def run_close_signal(self, ib, account, symbol, close_action,
-                               volume, open_price, open_action, csv_path) -> bool:
+                               volume, open_price, open_action, csv_path,
+                               target_lot_id: str = '', strategy: str = '',
+                               reason: str = '') -> bool:
         """执行一个平仓信号（带重试+持仓复核）
 
-        返回 True = 已平仓或确认目标方向仓位已归零；
-        返回 False = 重试次数用尽仍未平完。
+        Returns:
+            True = 已平仓或确认目标方向仓位已归零；
+            False = 重试次数用尽仍未平完。
+
+        Args 新增（可选）：
+            target_lot_id: 指定要平的批次；空 → 事件流按 FIFO 分配
+            strategy/reason: 写入事件流的审计字段
         """
         return await self._execute_close_with_retry(
             ib, account, symbol, close_action, volume,
-            open_price, open_action, csv_path
+            open_price, open_action, csv_path,
+            target_lot_id=target_lot_id, strategy=strategy, reason=reason
         )
 
     # ------------------------------------------------------------------
@@ -113,12 +126,21 @@ class CloseManager:
         return int(snap.get(symbol, {'position': 0})['position'])
 
     async def _execute_close_with_retry(self, ib: IB, account: str, symbol: str, close_action: str,
-                                        volume: int, open_price: float, open_action: str, csv_path) -> bool:
+                                        volume: int, open_price: float, open_action: str, csv_path,
+                                        target_lot_id: str = '', strategy: str = '',
+                                        reason: str = '', force: bool = False,
+                                        reconcile: bool = False,
+                                        actual_commission=None) -> bool:
         """
         带重试的平仓执行（重试前复核实际持仓，防止"已成交+重试"双重平仓）
 
         Returns:
             bool: True=已平仓或仓位确认已归零; False=重试次数用尽仍未平完
+
+        Args 新增（可选）：
+            target_lot_id/strategy/reason: 事件流审计字段
+            force: True → 事件类型 FORCE_CLOSE（强平）
+            reconcile: True → 事件类型 RECONCILE（调平/回填）
         """
         for attempt in range(CLOSE_MAX_RETRIES + 1):
             if attempt > 0:
@@ -152,7 +174,12 @@ class CloseManager:
 
                 self.logger.info(f"🔄 {symbol}: 第 {attempt} 次重试平仓 ({volume}股)...")
 
-            success = await self._execute_close(ib, symbol, close_action, volume, open_price, open_action, csv_path)
+            success = await self._execute_close(
+                ib, symbol, close_action, volume, open_price, open_action, csv_path,
+                target_lot_id=target_lot_id, strategy=strategy, reason=reason,
+                force=force, reconcile=reconcile,
+                actual_commission=actual_commission
+            )
             if success:
                 return True
 
@@ -160,8 +187,17 @@ class CloseManager:
         return False
 
     async def _execute_close(self, ib: IB, symbol: str, close_action: str,
-                             volume: int, open_price: float, open_action: str, csv_path) -> bool:
-        """执行单次平仓，返回是否成功（全部成交才返回 True）"""
+                             volume: int, open_price: float, open_action: str, csv_path,
+                             target_lot_id: str = '', strategy: str = '',
+                             reason: str = '', force: bool = False,
+                             reconcile: bool = False,
+                             actual_commission=None) -> bool:
+        """执行单次平仓，返回是否成功（全部成交才返回 True）
+
+        账本写入双路径：
+        - trade_store 可用 → 事件流（按批次 FIFO / target_lot_id 分配，实际佣金按比例拆分）；
+        - 否则 → 旧 CSV 回写（update_close_data_in_csv 兜底）。
+        """
         self.logger.info(f"🔄 {symbol}: 开始执行 {close_action} 平仓 {volume}股...")
 
         trade = await submit_buy_order(ib, symbol, volume) if close_action == 'buy' else await submit_sell_order(
@@ -204,20 +240,63 @@ class CloseManager:
         close_price = get_fill_price(trade)
         close_fund = close_price * close_vol
 
-        open_fund = open_price * close_vol
-        gross_profit = (open_fund - close_fund) if open_action == 'sell' else (close_fund - open_fund)
-
-        commission = 0.0
+        # ==================== 实际佣金（旧路径净利 与 事件流拆行 共用） ====================
+        actual_commission = (volume + close_vol) * ESTIMATED_COMMISSION_RATE
         try:
             comm = trade.commission()
             if comm is not None and comm != 1.7976931348623157e+308:
-                commission = comm
-            else:
-                commission = (volume + close_vol) * ESTIMATED_COMMISSION_RATE
+                actual_commission = float(comm)
         except Exception:
-            commission = (volume + close_vol) * ESTIMATED_COMMISSION_RATE
+            pass
 
-        profit = gross_profit - commission
+        if csv_path is None:
+            # 反向残留/历史残留仓：没有对应的开仓记录，不能回写账本
+            self.logger.critical(
+                f"🚨 {symbol}: 残留仓平仓完成 {close_vol}股 @ ${close_price:.2f} "
+                f"(非本次对冲开仓记录，未写入账本，请人工登记核对)"
+            )
+            return True
+
+        if self.trade_store is not None:
+            # ==================== 事件流写入（新路径） ====================
+            store_account = 'account1' if ib is self.ib1 else 'account2'
+            # 账本缺口预检：平仓数量 > 账上未平批次 → 疑似延迟开仓成交或开仓记录缺失
+            try:
+                remaining_lot = sum(int(l['remaining'])
+                                    for l in self.trade_store.get_open_lots(store_account, symbol))
+                if close_vol > remaining_lot:
+                    self.logger.critical(
+                        f"🚨 {symbol}: 平仓成交 {close_vol}股 > 账上未平批次 {remaining_lot}股 —— "
+                        f"疑似延迟开仓成交或开仓记录缺失，账本只记 {remaining_lot}股，"
+                        f"超出 {close_vol - remaining_lot}股 请人工核对两账户"
+                    )
+            except Exception as e:
+                self.logger.warning(f"⚠️ {symbol}: 未平批次预检失败: {e}")
+
+            ok = self.trade_store.append_close(
+                account=store_account, symbol=symbol,
+                close_action=close_action, volume=close_vol, price=close_price,
+                event_datetime=datetime.datetime.now(),
+                target_lot_id=target_lot_id or None,
+                strategy=strategy or 'dynamic_tp', reason=reason or 'close',
+                force=force, reconcile=reconcile,
+                actual_commission=actual_commission,
+            )
+            if ok:
+                self.logger.info(
+                    f"✅ {symbol}: 平仓完成，事件流已写入 | {close_vol}股 @ ${close_price:.2f} | "
+                    f"strategy={strategy or 'dynamic_tp'}"
+                )
+            else:
+                self.logger.critical(
+                    f"🚨 {symbol}: 平仓完成但事件流无可扣减的开仓批次（账本缺口）—— 请人工补记账"
+                )
+            return True
+
+        # ==================== 旧 CSV 回写路径（trade_store 不可用兜底） ====================
+        open_fund = open_price * close_vol
+        gross_profit = (open_fund - close_fund) if open_action == 'sell' else (close_fund - open_fund)
+        profit = gross_profit - actual_commission
 
         close_data = {
             'close_datetime': format_datetime(datetime.datetime.now()),
@@ -228,13 +307,7 @@ class CloseManager:
             'profit': round(profit, 2)
         }
 
-        if csv_path is None:
-            # 反向残留/历史残留仓：没有对应的开仓记录，不能回写CSV
-            self.logger.critical(
-                f"🚨 {symbol}: 残留仓平仓完成 {close_vol}股 @ ${close_price:.2f} "
-                f"(非本次对冲开仓记录，未写入CSV，请人工登记核对)"
-            )
-        elif update_close_data_in_csv(csv_path, symbol, open_action, close_data):
+        if update_close_data_in_csv(csv_path, symbol, open_action, close_data):
             self.logger.info(f"✅ {symbol}: 平仓完成并更新CSV | 净利: ${profit:.2f}")
         else:
             self.logger.warning(f"⚠️ {symbol}: 平仓完成但更新CSV失败")
@@ -383,7 +456,8 @@ class CloseManager:
             )
         await self._execute_close_with_retry(
             ib, account, symbol, side, vol, avg_cost,
-            open_action if standard else None, csv_path
+            open_action if standard else None, csv_path,
+            strategy='force_close', reason='收市前强制平仓', force=True
         )
 
     # ------------------------------------------------------------------
@@ -434,10 +508,136 @@ class CloseManager:
             self.logger.error(f"❌ 获取 fills 失败: {e}")
             return
 
+        if self.trade_store is not None:
+            # ==================== 事件流回填（新路径） ====================
+            # 账户1 平仓 = BUY 方向成交；账户2 平仓 = SELL 方向成交
+            p1 = self._backfill_store_account('account1', fills1, 'BUY')
+            p2 = self._backfill_store_account('account2', fills2, 'SELL')
+            self.logger.info(f"✅ 事件流补写完成: account1 {p1} 行, account2 {p2} 行")
+            return
+
+        # ==================== 旧 CSV 回填（trade_store 不可用兜底） ====================
         # 补写 sell.csv（账户1的平仓 = buy 操作）
         self._backfill_csv(fills1, 'BUY', 'sell', self.sell_csv_path)
         # 补写 buy.csv（账户2的平仓 = sell 操作）
         self._backfill_csv(fills2, 'SELL', 'buy', self.buy_csv_path)
+
+    def _resolve_close_time(self, sym_fills, symbol: str) -> str:
+        """解析平仓入账时间（美东时间字符串）——时区加固，新旧路径共用
+
+        9.14 SBET/ASST、9.16 EOSE、9.18 GNRC/RXRX/ABSI 事故加固（详见模块头注释）：
+        - execution.time → UTC 时刻（aware 原样 / naive 按 UTC 墙钟 / epoch 换算）；
+        - 收到时刻交叉校验（fill.time，机器时钟、不受 TWS 时区设置影响）：
+          偏差 > 10 分钟 → 判定时区约定已失效，改用收到时刻 + CRITICAL；
+        - 无法解析 → 回退收到时刻/机器时钟，绝不把坏时间写入账本。
+        """
+        def _utc_key(f):
+            t = _to_utc_instant(getattr(f.execution, 'time', None))
+            return t if t is not None else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
+        last_fill = max(sym_fills, key=_utc_key)
+        exec_utc = _utc_key(last_fill)
+        recv_utc = _to_utc_instant(getattr(last_fill, 'time', None))
+
+        if recv_utc is not None:
+            drift = abs((exec_utc - recv_utc).total_seconds())
+            if drift > 600:
+                self.logger.critical(
+                    f"🚨 {symbol}: IB 成交回报时间 {exec_utc.strftime('%Y-%m-%d %H:%M:%S UTC')} 与"
+                    f"收到时刻 {recv_utc.strftime('%Y-%m-%d %H:%M:%S UTC')} 偏差 {drift/60:.0f} 分钟 —— "
+                    f"时区约定很可能已失效（TWS 时区改动 / ib_async 解码异常）。"
+                    f"已改用收到时刻写入账本；请立即核对 Client Portal 成交明细!"
+                )
+                exec_utc = recv_utc
+        else:
+            if exec_utc.year == datetime.datetime.min.year:
+                self.logger.error(f"⚠️ {symbol}: 成交时间无法解析 —— 回退为当前机器时钟")
+                exec_utc = datetime.datetime.now(datetime.timezone.utc)
+            else:
+                self.logger.warning(
+                    f"⚠️ {symbol}: 无收到时刻可用于交叉校验，直接采用 execution.time"
+                    f"（={exec_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}）"
+                )
+        return exec_utc.astimezone(_EST_TZ).strftime('%Y-%m-%d %H:%M:%S')
+
+    def _backfill_store_account(self, account: str, fills, close_side: str) -> int:
+        """退出前事件流回填：按该账户每只股票的未平批次，把平仓成交分配写入平仓事件
+
+        - 每批一行（related_lot_id 关联），event_type=RECONCILE，strategy=reconcile；
+        - 平仓成交 > 未平批次（延迟开仓成交场景）→ 只记未平部分并 CRITICAL 告警；
+        - 入账时间沿用 _resolve_close_time 的时区加固逻辑（与旧路径一致）。
+        """
+        store = self.trade_store
+        close_action = 'buy' if account == 'account1' else 'sell'
+        account_dir = Path(store.account_dirs[account])
+        patched = 0
+        if not Path(account_dir).exists():
+            return 0
+
+        for stock_csv in sorted(Path(account_dir).glob('*.csv')):
+            symbol = stock_csv.stem
+            try:
+                lots = store.get_open_lots(account, symbol)
+            except Exception as e:
+                self.logger.warning(f"⚠️ {symbol}: 读取未平批次失败: {e}")
+                continue
+            if not lots:
+                continue
+
+            # 汇总该股票平仓方向成交
+            close_fills = []
+            total_fill = 0
+            fill_cost = 0.0
+            for f in fills:
+                if normalize_side(f.execution.side) != normalize_side(close_side):
+                    continue
+                if f.contract.symbol != symbol:
+                    continue
+                try:
+                    sh = abs(int(float(f.execution.shares)))
+                except Exception:
+                    continue
+                if sh <= 0:
+                    continue
+                close_fills.append(f)
+                total_fill += sh
+                try:
+                    fill_cost += sh * float(f.execution.price)
+                except Exception:
+                    pass
+            if total_fill <= 0:
+                continue
+
+            avg_price = (fill_cost / total_fill) if total_fill else 0.0
+            remaining = sum(int(l['remaining']) for l in lots)
+            if total_fill > remaining:
+                self.logger.critical(
+                    f"🚨 {symbol} ({account}): 退出回填平仓成交 {total_fill}股 > 未平批次 {remaining}股 —— "
+                    f"可能有延迟开仓成交，账本只记 {remaining}股，请立即核对账户实际持仓!"
+                )
+
+            dt_str = self._resolve_close_time(close_fills, symbol)
+
+            remaining_to_close = remaining
+            for lot in lots:
+                if remaining_to_close <= 0:
+                    break
+                alloc = min(remaining_to_close, int(lot['remaining']))
+                ok = store.append_close(
+                    account=account, symbol=symbol, close_action=close_action,
+                    volume=alloc, price=avg_price, event_datetime=dt_str,
+                    target_lot_id=lot['lot_id'],
+                    strategy='reconcile', reason='退出前补写',
+                    reconcile=True,
+                )
+                if ok:
+                    patched += 1
+                    self.logger.info(
+                        f"📝 补写: {symbol} ({account}) {lot['lot_id']} | "
+                        f"平仓 {alloc}股 @ ${avg_price:.4f}"
+                    )
+                remaining_to_close -= alloc
+        return patched
 
     def _backfill_csv(self, fills, close_side: str, open_action: str, csv_path):
         """
@@ -537,40 +737,11 @@ class CloseManager:
             # 修复：
             #   1) account.py 建连时设 ib.TimezoneTWS='UTC'（告知 ib_async TWS 回报用 UTC），
             #      使 execution.time 成为正确时刻；
-            #   2) 此处统一转美东(_EST_TZ)再写 CSV；
+            #   2) 此处统一转美东(_EST_TZ)再写账本；
             #   3) 兜底：用「成交回报收到时刻」(fill.time，机器时钟、不受 TWS 时区设置影响) 交叉校验，
-            #      偏差 >10 分钟说明时区约定已失效 —— 改用收到时刻并记 CRITICAL，绝不把坏时间写进 CSV。
-            sym_fills = close_fills_by_symbol[symbol]
-
-            def _utc_key(f):
-                t = _to_utc_instant(getattr(f.execution, 'time', None))
-                return t if t is not None else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
-
-            last_fill = max(sym_fills, key=_utc_key)
-            exec_utc = _utc_key(last_fill)
-            recv_utc = _to_utc_instant(getattr(last_fill, 'time', None))
-
-            if recv_utc is not None:
-                drift = abs((exec_utc - recv_utc).total_seconds())
-                if drift > 600:
-                    self.logger.critical(
-                        f"🚨 {symbol}: IB 成交回报时间 {exec_utc.strftime('%Y-%m-%d %H:%M:%S UTC')} 与"
-                        f"收到时刻 {recv_utc.strftime('%Y-%m-%d %H:%M:%S UTC')} 偏差 {drift/60:.0f} 分钟 —— "
-                        f"时区约定很可能已失效（TWS 时区改动 / ib_async 解码异常）。"
-                        f"已改用收到时刻写入 CSV；请立即核对 Client Portal 成交明细!"
-                    )
-                    exec_utc = recv_utc
-            else:
-                if exec_utc.year == datetime.datetime.min.year:
-                    self.logger.error(f"⚠️ {symbol}: 成交时间无法解析 —— 回退为当前机器时钟")
-                    exec_utc = datetime.datetime.now(datetime.timezone.utc)
-                else:
-                    self.logger.warning(
-                        f"⚠️ {symbol}: 无收到时刻可用于交叉校验，直接采用 execution.time"
-                        f"（={exec_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}）"
-                    )
-
-            close_dt_str = exec_utc.astimezone(_EST_TZ).strftime('%Y-%m-%d %H:%M:%S')
+            #      偏差 >10 分钟说明时区约定已失效 —— 改用收到时刻并记 CRITICAL，绝不把坏时间写进账本。
+            # （加固逻辑已抽取为 _resolve_close_time，与事件流回填路共用，保证两条路径行为一致）
+            close_dt_str = self._resolve_close_time(close_fills_by_symbol[symbol], symbol)
 
             close_data = {
                 'close_datetime': close_dt_str,

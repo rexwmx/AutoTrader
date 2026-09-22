@@ -34,5 +34,11 @@ SELECTED_STOCKS_FILE = 'selected_stocks.csv'
 SELL_RECORDS_FILE = 'sell.csv'
 BUY_RECORDS_FILE = 'buy.csv'
 
+# ==================== 交易数据存储（事件流）目录配置 ====================
+ACCOUNT1_DIR = 'account1'          # 账户1（做空账户）事件流目录
+ACCOUNT2_DIR = 'account2'          # 账户2（做多对冲账户）事件流目录
+SELL_SUMMARY_FILE = 'sell.csv'     # 账户1 日汇总（按股票一行，由事件流重建）
+BUY_SUMMARY_FILE = 'buy.csv'       # 账户2 日汇总（按股票一行，由事件流重建）
+
 # ==================== 时区配置 ====================
 TIMEZONE_EST = 'US/Eastern'

@@ -163,6 +163,7 @@ class DynamicTPStrategy(BaseStrategy):
             symbol=bar.symbol, account='account1',
             side='buy', volume=abs(int(pos.acc1_pos)),
             open_action='sell', reason=reason,
+            strategy='dynamic_tp',
         )
 
     def _check_long(self, bar: Bar, pos: PositionView,
@@ -199,6 +200,7 @@ class DynamicTPStrategy(BaseStrategy):
             symbol=bar.symbol, account='account2',
             side='sell', volume=int(pos.acc2_pos),
             open_action='buy', reason=reason,
+            strategy='dynamic_tp',
         )
 
     # ------------------------------------------------------------------

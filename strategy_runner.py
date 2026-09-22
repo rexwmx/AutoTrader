@@ -256,5 +256,8 @@ class StrategyRunner:
 
         return await self.close_manager.run_close_signal(
             ib, acct, sig.symbol, sig.side, sig.volume,
-            open_price, sig.open_action, csv
+            open_price, sig.open_action, csv,
+            target_lot_id=sig.target_lot_id,
+            strategy=sig.strategy,
+            reason=sig.reason,
         )

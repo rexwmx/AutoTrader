@@ -85,11 +85,13 @@ class FakeCloseManager:
         self.result = True
 
     async def run_close_signal(self, ib, account, symbol, close_action, volume,
-                              open_price, open_action, csv_path):
+                              open_price, open_action, csv_path, **kwargs):
+        # **kwargs 兼容事件流扩展参数（target_lot_id / strategy / reason）
         self.calls.append({
             'ib': ib, 'account': account, 'symbol': symbol,
             'action': close_action, 'volume': volume,
             'open_price': open_price, 'open_action': open_action, 'csv': csv_path,
+            **kwargs,
         })
         return self.result
 
