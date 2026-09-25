@@ -48,8 +48,11 @@ class StrategyRunner:
         # 让路开关：强制平仓窗口内/结束后不再触发运行时信号
         self.active = False
         self.activate_at: Optional[datetime.datetime] = None
-        # 调平互斥开关：调平运行期间禁止策略处理bar（防止与调平单并发写同一账户/标的）
-        self._reconcile_pause = False
+        # 【R5 标的级调平暂停】取代旧的全局 bool 开关。
+        # 每轮调平只把"本轮实际在调的标的"加入该集合；集合之外的标的 bar 照常评估执行。
+        # 被暂停标的：信号不丢弃，先排队，本轮解除暂停时重放（走既有 dispatch 失败/回滚语义）。
+        self._paused_symbols: set = set()
+        self._paused_pending: list = []   # [(CloseSignal, PositionView), ...]
         # 每只标的的最早建仓时间（用于跳过建仓前的历史 bar），统一为美东 aware
         self.entry_times: dict = {}
 
@@ -114,21 +117,66 @@ class StrategyRunner:
         self.active = False
         self.logger.info("🔴 运行时策略已停用（强制平仓窗口接管）")
 
-    def pause_for_reconcile(self) -> None:
-        """调平开始：调平运行期间策略暂停处理 bar（含平仓单执行）。
+    def pause_symbols(self, symbols) -> None:
+        """【R5】标的级调平暂停：只把本轮实际在调的标的加入暂停集合。
 
-        背景（2026-09-14 OKLO 实例）：超时买单延迟成交导致账户2 持仓在调平窗口内
-        0→28→84 剧烈变化；若策略同时基于中间快照发出平仓单，会与调平单（补买/反向补卖）
-        交叉撮合 → 超卖/裸仓。entry_times 只保护"建仓前"，管不住"调平中"。
+        背景（2026-09-14 OKLO 实例 + 2026-09-21 事故）：
+        - 调平窗口内策略基于中间快照（0→28→84 剧烈变化过程）发出平仓单，会与调平单
+          （补买/反向补卖）交叉撮合 → 超卖/裸仓，必须在"正在调的标的"上禁发平仓单；
+        - 旧的全局 bool 一刀切暂停，副作用是 2026-09-21 里 RDW/MARA/TRLV/BTDR/KEEL
+          这 5 只标的开盘窗口 bar1 判定被整根丢弃（特殊策略状态永久丢失）。
+        标的级暂停消除了这个副作用：不在集合里的标的 bar 照常评估执行。
         """
-        self._reconcile_pause = True
-        self.logger.info("⏸️ 策略执行暂停（调平进行中，防止与调平单并发下达）")
+        added = [s for s in (symbols or []) if s and s not in self._paused_symbols]
+        for s in added:
+            self._paused_symbols.add(s)
+        if added:
+            self.logger.info(f"⏸️ 标的级调平暂停: {sorted(added)}（其余标的 bar 正常评估执行）")
 
-    def resume_after_reconcile(self) -> None:
-        """调平结束：恢复策略 bar 处理"""
-        if self._reconcile_pause:
-            self._reconcile_pause = False
-            self.logger.info("▶️ 调平结束，策略执行恢复")
+    def unpause_symbols(self, symbols=None) -> None:
+        """【R5】解除标的级调平暂停（symbols=None → 全部解除）"""
+        if symbols is None:
+            cleared = sorted(self._paused_symbols)
+            self._paused_symbols.clear()
+        else:
+            cleared = [s for s in (symbols or []) if s in self._paused_symbols]
+            for s in cleared:
+                self._paused_symbols.discard(s)
+        if cleared:
+            self.logger.info(f"▶️ 标的级调平暂停解除: {cleared}")
+
+    async def replay_paused_signals(self) -> int:
+        """【R5】轮末重放暂停期间排队的信号。
+
+        严格走既有 dispatch 失败/回滚语义：
+        - 成功 → on_execution_result(sig, True)（保留去重标记）；
+        - 失败/异常 → on_execution_result(sig, False)（策略回滚去重标记，下一根 bar 可重试）。
+        绝不做"评估了但不执行"：信号在生成时已按既有语义设置去重标记，
+        这里要么执行、要么回滚，二者必居其一。
+        """
+        if not self._paused_pending:
+            return 0
+        pending, self._paused_pending = self._paused_pending, []
+        self.logger.info(f"▶️ 轮末重放 {len(pending)} 个调平期间排队的平仓信号")
+        # 按 PositionView 分组（同一根 bar 的信号共享同一快照视图）后统一分发
+        groups: dict = {}
+        order: list = []
+        for sig, pos in pending:
+            if pos not in groups:
+                groups[pos] = []
+                order.append(pos)
+            groups[pos].append(sig)
+        for pos in order:
+            await self._execute_signals(groups[pos], pos)
+        return len(pending)
+
+    def _queue_paused_signals(self, signals, pos) -> None:
+        for sig in signals:
+            self._paused_pending.append((sig, pos))
+        self.logger.info(
+            f"⏸️ [{pos.symbol}] 该标的正在调平：{len(signals)} 个平仓信号已排队，"
+            f"本轮解除暂停后按 dispatch 语义重放（不会静默丢弃）"
+        )
 
     # ------------------------------------------------------------------
     # 开盘窗口判定
@@ -169,10 +217,9 @@ class StrategyRunner:
         if self.activate_at and datetime.datetime.now() < self.activate_at:
             return
 
-        # 调平运行中：跳过本根 bar（极端值追踪从下一根恢复；安全优先于抢 1 个 bar 窗口）
-        if self._reconcile_pause:
-            self.logger.info(f"⏸️ [{bar.symbol}] 调平进行中，跳过本根 bar（下一根恢复）")
-            return
+        # 【R5 标的级暂停】不再整根跳过 bar（旧逻辑会把开盘窗口 bar1 的判定整根丢弃）；
+        # 暂停只作用于"信号执行"：被暂停标的照常评估（策略状态/极值正常更新），
+        # 信号排队、本轮解除暂停时重放。见 _queue_paused_signals / replay_paused_signals。
 
         # 建仓前的历史 bar 直接跳过（不拉持仓，省 TWS 请求）
         # 例外：开盘前两分钟窗口内的 bar —— 第一分钟 bar 的 dt（=开盘时刻）天然早于
@@ -213,7 +260,17 @@ class StrategyRunner:
         if not signals:
             return
 
-        # 3. 并发执行信号（异常隔离）
+        # 【R5】本标的正在调平 → 信号排队，轮末 replay_paused_signals 重放
+        if bar.symbol in self._paused_symbols:
+            self._queue_paused_signals(signals, pos)
+            return
+
+        await self._execute_signals(signals, pos)
+
+    async def _execute_signals(self, signals, pos) -> None:
+        """并发执行信号（异常隔离）+ 结果回传策略（失败回滚去重标记）
+
+        正常 bar 路径与【R5】轮末重放路径共用同一套执行/回滚语义。"""
         results = await asyncio.gather(
             *(self._dispatch(sig, pos) for sig in signals),
             return_exceptions=True
@@ -226,7 +283,7 @@ class StrategyRunner:
                 success = False
             else:
                 success = bool(r)
-            # 4. 把结果回传给策略（失败时回滚去重标记）
+            # 把结果回传给策略（失败时回滚去重标记）
             try:
                 self.strategy.on_execution_result(sig, success)
             except Exception as e:

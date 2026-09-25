@@ -246,6 +246,44 @@ class TradeStore:
         return lot_id
 
     # ------------------------------------------------------------------
+    # 差额幂等补记（P0 地基：账本完整性统一口径）
+    # ------------------------------------------------------------------
+    def ensure_cover(self, account: str, symbol: str, target_vol: int,
+                     price: float, exchange: str = '', industry: str = '',
+                     event_datetime=None, strategy: str = 'reconcile',
+                     reason: str = '') -> int:
+        """差额幂等补记：保证该标的账上未平批次 ≥ target_vol，只补「实际 − 已入账」差额
+
+        统一口径（2026-09-21 事故修正）：判重必须是「数量差额」而非「是否有过开仓记录」——
+        - 曾有 lot 但被超额平仓、账户里仍留着延迟成交持仓（KEEL 型）→ 差额仍需补；
+        - 已入账覆盖 target（调平已补写过 / 阶段8已补记过）→ 差额为 0，**绝不新增 lot**；
+        - 重复调用完全幂等（同一 (account, symbol, target_vol) 多次调用结果一致）。
+
+        阶段8延迟补齐、终态补平、收敛循环收尾全部经由本方法补记，杜绝多路径各记一遍。
+
+        Returns:
+            本次实际补记的股数（无差额可补 → 0）
+        """
+        try:
+            target_vol = int(target_vol)
+            price = float(price)
+        except Exception:
+            return 0
+        if account not in self.account_dirs or target_vol <= 0 or price <= 0:
+            return 0
+        booked = sum(int(l['remaining']) for l in self.get_open_lots(account, symbol))
+        gap = max(0, target_vol - booked)
+        if gap <= 0:
+            return 0
+        self.append_open(
+            account=account, symbol=symbol, price=price, volume=gap,
+            exchange=exchange, industry=industry,
+            event_datetime=event_datetime,
+            strategy=strategy, reason=reason or '差额幂等补记'
+        )
+        return gap
+
+    # ------------------------------------------------------------------
     # 减仓 / 平仓
     # ------------------------------------------------------------------
     def append_close(self, account: str, symbol: str,

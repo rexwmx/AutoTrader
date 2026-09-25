@@ -34,7 +34,7 @@ from selector import select_stocks
 from csv_writer import write_selected_stocks
 from trade_store import TradeStore
 from hedge import (
-    pre_submit_sell_orders, confirm_short_positions, execute_hedge_buys,
+    pre_submit_sell_orders, confirm_short_positions,
 )
 from position import reconcile_positions, get_positions, PositionSnapshotError
 from realtime import RealtimeDataRecorder
@@ -290,72 +290,75 @@ async def main():
         return
 
     # ============================================================
-    # 阶段7: 双通道并发（通道1: 账户2买入对冲 | 通道2: 订阅1分钟数据）
+    # 阶段7: 建仓收敛循环（R1）∥ 1分钟数据订阅（双通道保持）
+    # 取代旧"通道1 买入补平(逐只3×5s核验) + 阶段7.5 三轮调平"：
+    #   ≤5轮 / 总预算90s，每轮: 权威双快照 → 缺口/超额 → 并行发单 →
+    #   逐单等待(20s上限)+filled优先终态判定 → 一次批量快照核验 →
+    #   【同轮超平】实际>目标 → 当轮立即卖出超额 → 未收敛隔5s再来。
+    # 收尾（循环内完成）: 终态快照 → P0 差额幂等补记 → 延迟标的补订阅/
+    # 入场登记（R10 吸收旧阶段7.6）→ 终态确认（不一致 CRITICAL）。
     # ============================================================
     logger.info("\n" + "=" * 50)
-    logger.info("🚀 阶段7: 双通道并发执行 (买入补平 + 1分钟数据订阅 同时发起)")
+    logger.info("🚀 阶段7: 建仓收敛循环 (缺口补买 ∥ 1分钟数据订阅 同时发起) + 同轮超平兜底")
     logger.info("=" * 50)
 
     recorder = RealtimeDataRecorder(ib1, minute_dir, runner)
-    await asyncio.gather(
-        execute_hedge_buys(ib2, account2, confirmed_stocks, pos1_snap,
-                           buy_csv_path, runner=runner, trade_store=trade_store),
-        recorder.subscribe_all(confirmed_stocks),
-    )
 
-    # ============================================================
     # 流心跳看门狗（2026-09-15 事故修复）
     # TWS↔IBKR 断连会杀死全部 1 分钟 keepUpToDate 流且恢复后不会自动重建；
     # 看门狗在 5 分钟无 bar 事件时自动诊断（API 连接 + 全量重订阅），
     # 回放数据只补写 CSV、不重放入策略。策略停用后（强制平仓窗口）自动静默。
-    # ============================================================
     recorder.start_feed_watchdog(is_quiet=lambda: not runner.active)
     logger.info("🫀 数据流心跳看门狗已启动（断流后自动巡检修复策略已就绪）")
 
-    # ============================================================
-    # 【方案B】策略激活前移到调平之前（生效时点仍是第一根bar边界 开盘+60s）
-    # 调平只是残留缺口兜底，不应占用策略就绪时间窗口；
-    # 若调平拖过边界（如 2026-09-14 三轮 64 秒），runner 自动顺延为立即生效。
-    # ============================================================
+    # 【方案B】策略激活前移到收敛循环之前（生效时点 = 第一根bar边界 开盘+60s）。
+    # 收敛循环只对本轮在调的标的做"标的级暂停"（R5），其余标的 bar 照常评估执行；
+    # 被暂停标的的信号排队、轮末重放。循环若拖过 bar 边界，runner 自动顺延为立即生效。
     if open_dt:
         runner.start(first_bar_boundary=open_dt + datetime.timedelta(seconds=60))
     else:
         runner.start(delay_seconds=60)
 
-    # ============================================================
-    # 阶段7.5: 调平兜底（多轮调平补齐残留缺口）
-    # 调平运行期间 strategy on_bar 被 pause 禁发平仓单，防止与调平单
-    # （补买/反向补卖）并发写同一账户/标的 → 超卖/裸仓（09-14 OKLO 型竞态）
-    # ============================================================
-    logger.info("\n" + "=" * 50)
-    logger.info("⚖️ 阶段7.5: 持仓调平兜底 (复核确认窗口的残留缺口)")
-    logger.info("=" * 50)
-    runner.pause_for_reconcile()
-    try:
-        await asyncio.sleep(3)  # 预留3秒让 TWS 确认买单的底层持仓更新
-        stock_info_map = {s.code: s for s in selected_stocks}
-        await reconcile_positions(
+    stock_info_map = {s.code: s for s in selected_stocks}
+    confirmed_codes = {s.code for s in confirmed_stocks}
+
+    # 收敛循环（通道1，ib2 下单/ib1+ib2 快照）与 1 分钟订阅（通道2，ib1 数据流）
+    # 走不同 TCP 连接，并行发起——开盘一分钟预算靠这个重叠保住。
+    converge_task = asyncio.ensure_future(
+        reconcile_positions(
             ib1, ib2, account1, account2,
             sell_csv_path=sell_csv_path,
             buy_csv_path=buy_csv_path,
             stock_info_map=stock_info_map,
-            trade_store=trade_store
+            trade_store=trade_store,
+            runner=runner,
+            recorder=recorder,
+            confirmed_codes=confirmed_codes,
         )
-    finally:
-        runner.resume_after_reconcile()
+    )
+    sub_ok = await recorder.subscribe_all(confirmed_stocks)
+    convergence = await converge_task
+    logger.info(
+        f"🎯 阶段7完成: 收敛={convergence['converged']} | "
+        f"调平单 {convergence['success_count']}/{convergence['total_adjustments']} 成功 | "
+        f"实际对冲 账户1={len(convergence['final_positions1'])}只, "
+        f"账户2={len(convergence['final_positions2'])}只 | 1分钟订阅 {sub_ok}/{len(confirmed_stocks)}"
+    )
 
     # ============================================================
-    # 阶段8: 对账审计与延迟成交补齐（基于调平结束后的稳定快照）
+    # 阶段8: 账实审计（只读断言）
+    # 差额补记 / 延迟标的补订阅 / 入场登记 均已在阶段7收敛收尾（R10/P0）完成，
+    # 这里只做"账 vs 实"的三向独立核对：出现缺口即 CRITICAL 人工跟进。
     # ============================================================
     logger.info("\n" + "=" * 50)
-    logger.info("📡 阶段8: 对账审计与延迟成交补齐")
+    logger.info("📡 阶段8: 账实审计 (三向核对：账本双边一致 / 账本↔TWS 双向吻合)")
     logger.info("=" * 50)
 
     # ==================== 关键修复：基于TWS实际持仓判断 ====================
     # 不依赖确认列表，而是检查TWS实际持仓
     # 使用权威快照（reqPositionsAsync 返回值），修复
     # "请求 + 固定sleep + 读长寿命缓存"的竞态（幽灵条目/半批读取会漏算对冲名单）
-    await asyncio.sleep(2)  # 等待TWS完成调平单的持仓更新
+    await asyncio.sleep(2)  # 等待TWS完成收敛循环末批订单的持仓更新
     pos1_all = await get_positions(ib1, account1)
     pos2_all = await get_positions(ib2, account2)
 
@@ -419,77 +422,17 @@ async def main():
     except Exception as e:
         logger.warning(f"⚠️ 开仓对账检查失败: {e}")
 
-    # ==================== 阶段7.6: 延迟成交标的补齐（Paper假Cancelled/延迟成交兜底） ====================
-    # 历史日志证据（2026-09-10/09-11）：多数标的的卖空实际是在"确认时点之后"才落账的，
-    # 旧流程依靠调平阶段的快照发现这些空头并补买，且订阅名单取自"调平后的TWS交集"
-    # 从而天然覆盖。新流程的确认/订阅名单是确认时点的小集合，必须在这里显式补齐，
-    # 否则这些标的既没有1分钟数据、也因为缺少 on_entry 登记而被策略 on_bar 跳过。
-    confirmed_codes = {s.code for s in confirmed_stocks}
+    # ==================== 延迟成交标的补齐（R10：并入收敛循环收尾，一处完成） ====================
+    # 历史日志证据（2026-09-10/09-11、2026-09-21 INFQ/MSTR）：多数标的的卖空实际是在
+    # "确认时点之后"才落账的。旧流程在这里显式补齐（补订阅/on_entry/差额补记）；
+    # 现已并入收敛循环收尾（position._finalize_convergence：终态快照 → P0 差额幂等补记
+    # → 补订阅 → 入场登记 → 终态确认），此处只保留"账 vs 实"的只读审计。
     late_symbols = sorted(sym for sym in actual_hedged_symbols if sym not in confirmed_codes)
     if late_symbols:
-        logger.warning(
-            f"🔁 检测到 {len(late_symbols)} 只标的在确认时点后延迟成交（调平已补买）: "
-            f"{late_symbols} —— 延迟订阅并注册策略入场信息"
+        logger.info(
+            f"🔁 延迟成交标的（确认时点后落账）: {late_symbols} —— "
+            f"补订阅/入场登记/差额补记已由阶段7收敛收尾统一完成"
         )
-        late_stocks = []
-        for sym in late_symbols:
-            if sym in stock_info_map:
-                late_stocks.append(stock_info_map[sym])
-            else:
-                late_stocks.append(StockInfo(
-                    code=sym, exchange='', industry='',
-                    open=0, high=0, low=0, close=0,
-                    volume=0, turnover_pct=0, y=0
-                ))
-        await recorder.subscribe_all(late_stocks)
-        late_entry_dt = datetime.datetime.now()
-
-        def _book_late_leg(account: str, posd: dict, stk):
-            """延迟成交持仓的账本补写 —— 只补「实际持仓 − 账上未平批次」的差额（幂等）
-
-            2026-09-21 事故：调平阶段已补写过 INFQ/MSTR 的开仓批次，
-            此处又按全量补记一次 → 两侧各多出一整批重复 lot（open_vol 12/146），
-            15:55 强平/退出回填把重复批次与实际成交轧账，佣金和盈亏被双倍计入。
-            判重口径必须是「数量差额」而非「是否有过开仓记录」。
-            """
-            if trade_store is None or not posd:
-                return
-            actual = abs(int(posd['position']))
-            if actual <= 0:
-                return
-            booked = sum(int(l['remaining']) for l in trade_store.get_open_lots(account, stk.code))
-            gap = max(0, actual - booked)
-            if gap > 0:
-                trade_store.append_open(
-                    account=account, symbol=stk.code, price=float(posd['avgCost']),
-                    volume=gap,
-                    exchange=stk.exchange, industry=stk.industry,
-                    event_datetime=late_entry_dt,
-                    strategy='hedge', reason='延迟成交补写(差额)'
-                )
-                logger.info(f"🧾 {stk.code}: {account} 延迟成交差额补记 {gap}股 @ ${float(posd['avgCost']):.4f}")
-            else:
-                logger.info(f"ℹ️ {stk.code}: {account} 延迟成交席位 {actual}股 已全部入账"
-                            f"（未平批次 {booked}股），跳过补记防止重复记账")
-
-        for stk in late_stocks:
-            p1 = pos1_all.get(stk.code, {})
-            p2 = pos2_all.get(stk.code, {})
-            if p1 and p1['position'] < 0:
-                _book_late_leg('account1', p1, stk)  # 账本补写：延迟落账的空头批（差额幂等）
-                try:
-                    runner.on_entry(stk.code, 'account1',
-                                    float(p1['avgCost']), abs(int(p1['position'])), late_entry_dt)
-                except Exception as e:
-                    logger.warning(f"⚠️ {stk.code}: 登记策略(account1,延迟)失败: {e}")
-            if p2 and p2['position'] > 0:
-                _book_late_leg('account2', p2, stk)  # 账本补写：延迟落账的对冲多批（差额幂等）
-                try:
-                    runner.on_entry(stk.code, 'account2',
-                                    float(p2['avgCost']), int(p2['position']), late_entry_dt)
-                except Exception as e:
-                    logger.warning(f"⚠️ {stk.code}: 登记策略(account2,延迟)失败: {e}")
-        logger.info(f"🔁 延迟标的补齐完成: {len(late_stocks)} 只已进入监控名单")
 
     if actual_hedged_stocks:
         # （策略激活已前移到阶段7.5之前；生效时点 = 第一根bar边界 开盘+60s，

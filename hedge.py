@@ -28,6 +28,10 @@ from constants import (
     TARGET_HEDGED_COUNT, FUND_PER_STOCK, ORDER_TIMEOUT, BATCH_SIZE
 )
 
+# 【R2】确认阶段双快照间隔：第 1 次快照 + 5s 后第 2 次快照取并集
+# （2026-09-21 INFQ 类"撤单后才落账"的空头由第 2 次快照接住）
+CONFIRM_UNION_DELAY_SECONDS = 5.0
+
 
 async def verify_buy_position(ib2: IB, symbol: str, expected_volume: int = 0,
                               retries: int = 3, delay: float = 5.0) -> dict:
@@ -130,8 +134,11 @@ async def confirm_short_positions(
 
     1) 并发撤销所有未成交的卖空挂单 + 一次 settle
        （替代串行 15×0.5s 撤单；锁定账户1空头头寸，杜绝开盘后延迟成交敞口）
-    2) 权威持仓快照确认空头：严格版+重试 3 次，失败抛 PositionSnapshotError
-       （避免静默空字典把"取数失败"误判成"无持仓"）
+    2) 【R2 双快照】权威持仓快照确认空头：第 1 次快照（撤单后，现有 09:30:23）
+       + 5s 后第 2 次快照取**并集**（冲突以较新的第 2 次为准）。
+       2026-09-21 的 INFQ（09:30:28 才落账）即由第 2 次快照接住；MSTR 类（09:31:20 后
+       才落账）接不住——接受它进入收敛循环（R1）处理。严格版+重试，失败抛
+       PositionSnapshotError（避免静默空字典把"取数失败"误判成"无持仓"）
     3) 按快照写账本并登记 runner（入场价 = 账户1 avgCost，权威成交均价）
        - trade_store 可用 → 事件流 account1/{symbol}.csv 记 OPEN 事件；
        - 否则 → 兜底旧 sell.csv append_trade_record。
@@ -162,8 +169,19 @@ async def confirm_short_positions(
     else:
         logger.info("🛑 [撤单] 无未成交挂单，直接确认持仓")
 
-    # ---- 2) 权威快照（严格版 + 3 次重试） ----
+    # ---- 2) 【R2 双快照】权威快照（严格版 + 重试）×2，取并集 ----
     pos1 = await get_positions_strict_with_retry(ib1, account1, retries=3, delay=2.0)
+    logger.debug(f"📊 确认快照#1: {len(pos1)} 只空头")
+    # 无论撤单与否都保留 5s 间隔：Paper 持仓落账本就可能晚于成交（撤单/成交均可能）
+    await asyncio.sleep(CONFIRM_UNION_DELAY_SECONDS)
+    pos1_b = await get_positions_strict_with_retry(ib1, account1, retries=3, delay=2.0)
+    # 并集：两次快照的标的都保留；冲突以更晚（更新）的第 2 次快照为准
+    merged = {**pos1, **pos1_b}
+    late_caught = sorted(set(pos1_b) - set(pos1))
+    if late_caught:
+        logger.info(f"🕗 双快照#2 补接住延迟落账空头: {late_caught}")
+    pos1 = merged
+    logger.debug(f"📊 确认快照(并集): {len(pos1)} 只空头")
 
     # ---- 3) 确认空头 + 写 CSV + 登记 runner ----
     stock_map = {stock.code: stock for stock, _ in submitted_trades}

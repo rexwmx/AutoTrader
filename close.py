@@ -27,6 +27,8 @@ ESTIMATED_COMMISSION_RATE = 0.0035
 CLOSE_RETRY_DELAY = 10
 CLOSE_MAX_RETRIES = 1
 CLOSE_CHECK_INTERVAL = 30
+# 【R9】退出回填前 fills 覆盖校验：收盘方向 fills 总量 < 计划平仓量 → 等待秒数后重取一次
+FILLS_COVERAGE_RETRY_SECONDS = 5
 
 # 补写时间写入 CSV 使用的时区（美东），与全系统 Bar.dt / 建仓时间同一基准
 _EST_TZ = pytz.timezone('US/Eastern')
@@ -508,6 +510,10 @@ class CloseManager:
             self.logger.error(f"❌ 获取 fills 失败: {e}")
             return
 
+        # 【R9】退出回填前核对：收盘方向 fills 总量 ≥ 计划平仓量；不足则等 5s 重取一次
+        # （2026-09-21 15:55 MSTR 卖单 fills 未全部到达时，旧成交被错配到 fake lot 的根因）
+        fills1, fills2 = await self._ensure_fills_coverage(fills1, fills2)
+
         if self.trade_store is not None:
             # ==================== 事件流回填（新路径） ====================
             # 账户1 平仓 = BUY 方向成交；账户2 平仓 = SELL 方向成交
@@ -521,6 +527,121 @@ class CloseManager:
         self._backfill_csv(fills1, 'BUY', 'sell', self.sell_csv_path)
         # 补写 buy.csv（账户2的平仓 = sell 操作）
         self._backfill_csv(fills2, 'SELL', 'buy', self.buy_csv_path)
+
+    # ------------------------------------------------------------------
+    # 【R9】退出回填前 fills 覆盖校验
+    # ------------------------------------------------------------------
+    def _planned_close_by_symbol(self, account: str) -> dict:
+        """该账户的计划平仓量 = 未完成开仓
+
+        - 事件流：每标的未平批次之和（get_open_lots remaining 求和）；
+        - 旧 CSV：该账户 CSV 中未平（无平仓行）的 vol 合计。
+        """
+        planned = {}
+        if self.trade_store is not None:
+            for code in self.trade_store.open_codes(account):
+                vol = sum(int(l['remaining']) for l in self.trade_store.get_open_lots(account, code))
+                if vol > 0:
+                    planned[code] = vol
+            return planned
+
+        path = self.sell_csv_path if account == 'account1' else self.buy_csv_path
+        if not path:
+            return planned
+        try:
+            import pandas as pd
+            df = pd.read_csv(path)
+            if df.empty or 'close_vol' not in df.columns:
+                return planned
+
+            def _blank(v) -> bool:
+                s = str(v).strip().lower()
+                return s in ('', 'nan', 'none', 'nat')
+
+            for _, row in df.iterrows():
+                if _blank(row.get('close_vol')) or _blank(row.get('close_datetime')):
+                    try:
+                        v = int(float(row['vol']))
+                    except Exception:
+                        continue
+                    if v > 0:
+                        code = str(row['code'])
+                        planned[code] = planned.get(code, 0) + v
+        except Exception as e:
+            self.logger.warning(f"⚠️ [R9] 读取计划平仓量(旧CSV)失败: {e}")
+        return planned
+
+    @staticmethod
+    def _fills_total_by_symbol(fills, close_side: str) -> dict:
+        """收盘方向成交按标的合并股数（normalize_side 兼容 BOT/SLD 协议值）"""
+        totals = {}
+        for f in fills or []:
+            try:
+                if normalize_side(f.execution.side) != normalize_side(close_side):
+                    continue
+                shares = abs(int(float(f.execution.shares)))
+                sym = getattr(getattr(f, 'contract', None), 'symbol', None)
+            except Exception:
+                continue
+            if not sym or shares <= 0:
+                continue
+            totals[sym] = totals.get(sym, 0) + shares
+        return totals
+
+    async def _ensure_fills_coverage(self, fills1, fills2) -> tuple:
+        """【R9】退出回填前核对：fills() 取数后校验各账户
+        「收盘方向 fills 总量 ≥ 计划平仓量」，不足则等 5s 重取一次。
+
+        2026-09-21 15:55 MSTR 事故：退出时部分卖单 fills 尚未全部到达，
+        回填逻辑拿更早的无关成交顶替、错配到 fake lot；本前置校验让
+        "fills 不足"被显式发现并等待到齐。
+        """
+        checks = [
+            (self.ib1, 'account1', 'BUY', fills1),
+            (self.ib2, 'account2', 'SELL', fills2),
+        ]
+        short = []
+        for _ib, account, side, fills in checks:
+            planned = self._planned_close_by_symbol(account)
+            if not planned:
+                continue
+            got = self._fills_total_by_symbol(fills, side)
+            for sym, need in sorted(planned.items()):
+                have = got.get(sym, 0)
+                if have < need:
+                    short.append(f"{account}[{sym}] fills {have} < 计划平仓 {need}")
+        if not short:
+            return fills1, fills2
+
+        self.logger.warning(
+            f"⚠️ [R9] 收盘方向 fills 不足: {'; '.join(short)} —— "
+            f"等待 {FILLS_COVERAGE_RETRY_SECONDS} 秒后重取一次"
+        )
+        await asyncio.sleep(FILLS_COVERAGE_RETRY_SECONDS)
+        orig1, orig2 = fills1, fills2
+        try:
+            fills1 = self.ib1.fills()
+            fills2 = self.ib2.fills()
+        except Exception as e:
+            self.logger.error(f"❌ [R9] 重取 fills 失败: {e} —— 沿用首次取数结果")
+            fills1, fills2 = orig1, orig2
+        # 重取后审计记录
+        for _ib, account, side, _fills in checks:
+            planned = self._planned_close_by_symbol(account)
+            if not planned:
+                continue
+            src = fills1 if account == 'account1' else fills2
+            got = self._fills_total_by_symbol(src, side)
+            still = [f"{sym} {got.get(sym, 0)}/{need}"
+                     for sym, need in sorted(planned.items()) if got.get(sym, 0) < need]
+            if still:
+                self.logger.error(
+                    f"🚨 [R9] 重取后收盘方向 fills 仍不足: {'; '.join(still)} —— "
+                    f"回填将按实际到手的 fills 执行，请人工核对账本"
+                )
+            else:
+                self.logger.info(f"✅ [R9] {account} 收盘方向 fills 已充足")
+        return fills1, fills2
 
     def _resolve_close_time(self, sym_fills, symbol: str) -> str:
         """解析平仓入账时间（美东时间字符串）——时区加固，新旧路径共用
