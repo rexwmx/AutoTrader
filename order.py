@@ -14,7 +14,10 @@ async def get_current_price(ib: IB, symbol: str) -> Optional[float]:
         contract = Stock(symbol, 'SMART', 'USD')
         qualified = await ib.qualifyContractsAsync(contract)
         if not qualified: return None
-        [ticker] = ib.reqTickers(qualified[0])
+        # 【2026-09-28】用异步版 reqTickersAsync（不阻塞事件循环）。
+        # 旧的同步 reqTickers 依赖 nest_asyncio 在运行中的循环里套一层 run_until_complete，
+        # 会阻塞整个循环——并发请求只能串行、早完成的要等晚发起的返回。
+        [ticker] = await ib.reqTickersAsync(qualified[0])
         price = ticker.marketPrice()
         if price and price > 0: return float(price)
         price = ticker.close

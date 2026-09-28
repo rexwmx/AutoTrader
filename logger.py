@@ -42,8 +42,29 @@ def setup_logging(log_dir: Path, log_file_name: str = 'hedge_trade.log') -> logg
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
 
+        # ---------------- ib_async 的日志也写入同一日志文件 ----------------
+        # ib_async 用独立的 logger（ib_async.client，父级 ib_async）。
+        # 此前这里只配置了本项目的 'hedge_trade' logger，导致 ib_async 自身的日志
+        # （限流、连接/断开、同步阶段错误、内部 error）没有任何文件 handler，
+        # 只能落到 logging.lastResort → 打印到标准错误（控制台），日志文件里看不到。
+        # 这里复用同一个文件 handler，让这部分信息也落进 hedge_trade.log。
+        #   * ib_async.client 的 DEBUG 级协议报文（">>> send msg..."）量极大，
+        #     因此 ib_async 侧级别取 WARNING（只收 error/warning，避免刷屏）；
+        #   * propagate=False + 自带一个 stderr 控制台 handler，避免重复输出，
+        #     同时保持与原先 lastResort 一致的控制台可见性。
+        ib_logger = logging.getLogger('ib_async')
+        if not any(isinstance(h, logging.FileHandler) for h in ib_logger.handlers):
+            ib_logger.setLevel(logging.WARNING)
+            ib_logger.addHandler(file_handler)
+            ib_console = logging.StreamHandler(sys.stderr)
+            ib_console.setLevel(logging.WARNING)
+            ib_console.setFormatter(formatter)
+            ib_logger.addHandler(ib_console)
+            ib_logger.propagate = False
+
         _logger = logger
         logger.info(f"日志系统初始化完成 | 日志文件: {log_file}")
+        logger.info("🔁 ib_async 内部日志（限流/连接/同步）已并入该日志文件")
         return logger
 
     except Exception as e:

@@ -597,6 +597,58 @@ class TradeStore:
         result.sort(key=lambda x: (x['event_datetime'], x['lot_id']))
         return result
 
+    def close_volume_since(self, account: str, symbol: str, ref_date) -> int:
+        """ref_date 当日入账的平仓事件量（CLOSE_TYPES 行，按 event_datetime 日期过滤）
+
+        【2026-09-22 退出补写去重】execId 去重的数量等价（不扩 CSV 列）：
+        会话 fills（同方向）− 当日已入账平仓量 = 未入账成交。
+        旧版退出补写把"全天同方向 fills"当未平量用，已被入账的平仓（如收敛循环
+        同轮超平卖出）会把数量/均价污染、并触发"成交 > 未平批次"误报。
+        无法解析日期的行不计入（保守：宁可少扣也不多扣，缺口由 CRITICAL 暴露）。
+        """
+        if account not in self.account_dirs:
+            return 0
+        f = self.stock_csv(account, symbol)
+        if not Path(f).exists():
+            return 0
+        df = self._read(f)
+        if df.empty or 'event_datetime' not in df.columns:
+            return 0
+        close_df = df[df['event_type'].isin(CLOSE_TYPES)]
+        if close_df.empty:
+            return 0
+        total = 0
+        for _, row in close_df.iterrows():
+            d = self._parse_event_date(row.get('event_datetime'))
+            if d is None or d != ref_date:
+                continue
+            total += int(_to_num(row.get('volume')))
+        return total
+
+    @staticmethod
+    def _parse_event_date(value):
+        """宽容解析 event_datetime 的日期部分（生产主格式 'YYYY-MM-DD HH:MM:SS'，
+        兼容 'YYYY/MM/DD...'、'MM/DD/YY...'）；无法解析 → None"""
+        if value is None:
+            return None
+        if isinstance(value, datetime.datetime):
+            return value.date()
+        try:
+            if isinstance(value, pd.Timestamp) and not pd.isna(value):
+                return value.date()
+        except Exception:
+            pass
+        s = str(value).strip()
+        if not s or s.lower() in ('nan', 'nat', 'none'):
+            return None
+        for fmt in ('%Y-%m-%d %H:%M:%S', '%Y/%m/%d %H:%M:%S',
+                    '%m/%d/%Y %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y'):
+            try:
+                return datetime.datetime.strptime(s, fmt).date()
+            except Exception:
+                continue
+        return None
+
     def open_codes(self, account: str) -> Set[str]:
         """该账户当前仍有未平完批次的股票代码集合（用于阶段8开仓对账）"""
         if account not in self.account_dirs:

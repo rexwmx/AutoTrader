@@ -56,6 +56,10 @@ class RealtimeDataRecorder:
         # ---- 订阅与回放安全状态（2026-09-15 事故修复） ----
         # 当前已订阅标的（重订阅的名单源）
         self._subscribed_symbols: Dict[str, StockInfo] = {}
+        # 【2026-09-28】每条活跃的 1分钟 keepUpToDate 数据订阅：symbol -> BarDataList
+        # （其上有 .reqId）。重订阅前先取消本标的旧订阅，防止断流修复反复触发时
+        # 旧请求永不取消、一路累积，最终撞上 IB 对同时打开的历史/行情请求的数量上限。
+        self._active_bars: Dict[str, object] = {}
         # 全局心跳：任意一次 bar 事件推送即刷新（naive 本地时间，仅用于间隔比较）
         self._last_bar_event: Optional[datetime] = None
         # 每标的已处理到的最大 bar 时间戳（EST aware）——重订阅回放去重，避免重复写 CSV
@@ -117,11 +121,16 @@ class RealtimeDataRecorder:
             self.logger.error(f"⚠️ TWS 错误事件处理异常: {e}")
 
     def _on_tws_disconnected(self, *args) -> None:
-        """IB API 与 TWS 的 API 连接断开（区别于 TWS↔IBKR 的 1100）"""
+        """IB API 与 TWS 的 API 连接断开（区别于 TWS↔IBKR 的 1100）
+
+        【2026-09-28】重连由 reconnector（同一 clientId、递进间隔）负责；
+        重连成功后 connectedEvent 触发本类钩子全量重订阅，看门狗兜底。
+        """
         try:
             self.logger.critical(
-                "🚨 IB API ↔ TWS 连接断开 ——订单/取数/行情全部不可用，"
-                "等待 TWS 重连后看门狗将自动修复数据流"
+                "🚨 IB API ↔ TWS 连接断开 —— 订单/取数/行情全部不可用；"
+                "reconnector 正按递进间隔自动重连（同一 clientId），"
+                "重连成功后本模块钩子将全量重订阅数据流（看门狗兜底）"
             )
         except Exception:
             pass
@@ -203,10 +212,37 @@ class RealtimeDataRecorder:
         )
         return all_ok
 
+    def _drop_subscription(self, symbol: str) -> None:
+        """取消并注销本标的当前活跃的 1分钟数据订阅。
+
+        【2026-09-28】断流修复（recover_feed/_renew_symbol）每重订阅一次就新发一路
+        reqHistoricalData(keepUpToDate)；旧的从不取消 → 反复修复时这些请求一路累积，
+        可能撞上 IB 对同时打开的历史/行情请求的数量上限，导致新订阅被拒。
+        现在重订阅前先取消旧订阅（同一标的始终只保留最新一路）。
+        用 ib.cancelHistoricalData(bars)：发 IB 消息 type-25（fire-and-forget，
+        不阻塞事件循环）并清掉 wrapper 内部的订阅登记。
+        """
+        bars = self._active_bars.pop(symbol, None)
+        if bars is None:
+            return
+        reqId = getattr(bars, 'reqId', None)
+        if reqId is None:
+            return
+        try:
+            self.ib.cancelHistoricalData(bars)
+            self.logger.debug(f"🧹 已取消 {symbol} 旧 1分钟数据订阅 (reqId={reqId})")
+        except Exception as e:
+            # 取消失败不影响新订阅（该旧请求可能本就已随断连失效）
+            self.logger.warning(f"⚠️ 取消 {symbol} 旧 1分钟数据订阅失败 (reqId={reqId}): {e}")
+
     async def _renew_symbol(self, stock: StockInfo) -> Tuple[bool, str]:
         """重建单标的的 1 分钟 keepUpToDate 订阅（新 reqId、新 BarList、新 handler）"""
         symbol = stock.code
         try:
+            # 【2026-09-28】重订阅前先取消本标的旧订阅——断流修复反复触发时，
+            # 旧 keepUpToDate 请求若不取消会累积，最终撞上 IB 并发请求数量上限而新订阅被拒
+            self._drop_subscription(symbol)
+
             contract = Stock(symbol, 'SMART', 'USD')
             qualified = await self.ib.qualifyContractsAsync(contract)
             if not qualified:
@@ -224,6 +260,7 @@ class RealtimeDataRecorder:
 
             csv_path = self._init_csv(symbol)
             self._create_bar_handler(symbol, bars, csv_path)
+            self._active_bars[symbol] = bars   # 登记新活跃订阅（供下次修复前取消）
             return True, f"重放 {len(bars)} 根历史 bar（已按时间戳去重/门控）"
         except Exception as e:
             return False, f"{e!r}"
@@ -395,11 +432,24 @@ class RealtimeDataRecorder:
 
                     stats = self.daily_stats[symbol]
                     is_new_day = stats["trade_date"] != current_trade_date
+                    # 正式开盘参照（本机时区）= 09:30 起的第一根 bar。
+                    # 注意：上面的过滤只剔除 09:29 之前的 bar，09:29 盘前 bar 会被处理——
+                    # 它是盘前行情，**不是**正式开盘价。
+                    official_open_dt = dt_est.replace(hour=9, minute=30, second=0, microsecond=0)
                     if is_new_day:
                         stats["trade_date"] = current_trade_date
-                        stats["day_open"] = bar.open
+                        # 【2026-09-27 修复】当天第一根 bar 若是 09:29 盘前 bar，
+                        # 不能直接取它的 open 作"当天开盘价"（旧行为会让全天
+                        # day_change_pct 都以盘前开盘价为基准）。盘前 bar 暂不设定
+                        # day_open，等第一根正式开盘 bar（≥09:30）到达时再取。
+                        stats["day_open"] = bar.open if dt_est >= official_open_dt else None
                         stats["day_max"] = bar.high
                         stats["day_min"] = bar.low
+                    elif stats.get("day_open") is None and dt_est >= official_open_dt:
+                        # 当天首根 bar 是盘前 bar（正式开盘价待定）→ 首根正式 bar 补定
+                        stats["day_open"] = bar.open
+                        stats["day_max"] = max(stats["day_max"], bar.high)
+                        stats["day_min"] = min(stats["day_min"], bar.low)
                     else:
                         stats["day_max"] = max(stats["day_max"], bar.high)
                         stats["day_min"] = min(stats["day_min"], bar.low)
@@ -413,16 +463,19 @@ class RealtimeDataRecorder:
                     else:
                         day_change_pct = 0.0
 
-                    if is_new_day or stats.get("day_change_pct_max") is None:
-                        stats["day_change_pct_max"] = day_change_pct
-                        stats["day_change_pct_min"] = day_change_pct
-                    else:
-                        stats["day_change_pct_max"] = max(
-                            stats["day_change_pct_max"], day_change_pct
-                        )
-                        stats["day_change_pct_min"] = min(
-                            stats["day_change_pct_min"], day_change_pct
-                        )
+                    # 日内极值只用"正式开盘价已定"后的 bar 累计（开盘价未知的盘前 bar
+                    # 其 pct 是 0.0 占位，绝不能拿来给 max/min 播种）
+                    if day_open and day_open != 0:
+                        if is_new_day or stats.get("day_change_pct_max") is None:
+                            stats["day_change_pct_max"] = day_change_pct
+                            stats["day_change_pct_min"] = day_change_pct
+                        else:
+                            stats["day_change_pct_max"] = max(
+                                stats["day_change_pct_max"], day_change_pct
+                            )
+                            stats["day_change_pct_min"] = min(
+                                stats["day_change_pct_min"], day_change_pct
+                            )
 
                     # 从 runner 拉展示字段（建仓后极值等，状态已下沉到策略）
                     # 注意：重放行也会走到这里——若该标的已平，get_display_state 无状态则返回空，安全
@@ -507,6 +560,8 @@ class RealtimeDataRecorder:
         symbol = stock.code
         try:
             self.logger.info(f"📡 订阅 {symbol} 1分钟数据...")
+            # 幂等：若该标的已有旧订阅（重复订阅/重入），先取消，避免累积旧请求
+            self._drop_subscription(symbol)
             contract = Stock(symbol, 'SMART', 'USD')
             qualified = await self.ib.qualifyContractsAsync(contract)
             if not qualified:
@@ -514,14 +569,21 @@ class RealtimeDataRecorder:
                 return False
             contract = qualified[0]
 
-            bars = self.ib.reqHistoricalData(
+            # 【2026-09-28】用异步版 reqHistoricalDataAsync（不阻塞事件循环）。
+            # 旧同步版依赖 nest_asyncio 在运行中的循环里套 run_until_complete：subscribe_all
+            # 里 asyncio.gather 看似并发，实际每只都被同步调用串行阻塞，早完成标的的
+            # bar 回调要等晚发起标的返回才处理——这是"开盘第一根 bar 能否进策略靠运气"的
+            # 根因之一。async 版本让 gather 真正并发（与 _renew_symbol 口径一致）。
+            bars = await self.ib.reqHistoricalDataAsync(
                 contract, endDateTime='', durationStr='2 D',
                 barSizeSetting='1 min', whatToShow='TRADES',
-                useRTH=False, formatDate=1, keepUpToDate=True
+                useRTH=False, formatDate=1, keepUpToDate=True,
+                timeout=30
             )
             csv_path = self._init_csv(symbol)
             self._create_bar_handler(symbol, bars, csv_path)
             self._subscribed_symbols[symbol] = stock
+            self._active_bars[symbol] = bars   # 登记活跃订阅（供断流修复前取消旧请求）
             self.logger.info(f"✅ {symbol}: 1分钟数据订阅成功")
             return True
         except Exception as e:

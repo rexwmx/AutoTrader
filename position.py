@@ -58,6 +58,17 @@ async def get_positions(ib: IB, account: str = "") -> Dict[str, dict]:
         for p in (latest or []):
             if account and getattr(p, 'account', '') != account:
                 continue
+            # 【只保留股票】账户里若有同名期权/期货等非股票持仓（secType != 'STK'），
+            # 绝不能混入快照：本程序只交易股票，按 symbol 建键时同名非股票持仓会
+            # 覆盖/顶掉真实股票持仓（dict 同键后者覆盖前者），导致调平/强平/策略
+            # 全部按"错误的股票持仓"动作（含对期权持仓发股票平仓单）。
+            sec_type = getattr(getattr(p, 'contract', None), 'secType', None) or 'STK'
+            if sec_type != 'STK':
+                logger.debug(
+                    f"🔍 快照剔除非股票持仓: {p.contract.symbol} secType={sec_type} "
+                    f"position={p.position}（本程序只管理股票持仓）"
+                )
+                continue
             if not p.position:
                 continue
             result[p.contract.symbol] = {
@@ -89,6 +100,16 @@ async def get_positions_strict(ib: IB, account: str = "") -> Dict[str, dict]:
     result = {}
     for p in (latest or []):
         if account and getattr(p, 'account', '') != account:
+            continue
+        # 【只保留股票】与 get_positions 同口径：同名期权/期货等非股票持仓
+        # （secType != 'STK'）不得混入决策快照，否则会顶掉/伪装成股票持仓，
+        # 触发对股票合约的错误调平/强平（详见 get_positions 注释）。
+        sec_type = getattr(getattr(p, 'contract', None), 'secType', None) or 'STK'
+        if sec_type != 'STK':
+            get_logger().debug(
+                f"🔍 严格快照剔除非股票持仓: {p.contract.symbol} secType={sec_type} "
+                f"position={p.position}"
+            )
             continue
         if not p.position:
             continue
@@ -388,7 +409,10 @@ def _filled_volume_now(trade) -> int:
 async def _settle_trade(ib: IB, trade, timeout: int = CONVERGE_ORDER_TIMEOUT) -> dict:
     """R7 收敛循环单订单终态判定
 
-    判定优先级（monitor.wait_for_trade_completion 内已实现 filled>0 > fills 列表 > status）：
+    wait 已升级（2026-09-27 monitor.wait_for_order_final）：等全量成交或终态才结算，
+    部分成交+仍在工作不再提前返回 —— 收敛循环**不撤剩余量**（剩余量继续工作/
+    由 ensure_cover 差额补记），旧"提前返回→按部分成交处理"的语义已消除。
+    判定优先级（monitor 内已实现 filled>0 > fills 列表 > status）：
     - filled 在 Paper 中常早于持仓落账，甚至早于状态翻转，因此一切结论以成交事实为准；
     - 超时/Cancelled 撤单前：先读一次原单 filled，>0 直接按成交（今日 MSTR 场景，撤单动作可省）；
     - 接受"未成交"前：保留 ≥3s 观察窗（今日 KEEL 通道1 的教训：即时判负 → 下一轮双买）。

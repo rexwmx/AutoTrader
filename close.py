@@ -21,7 +21,10 @@ from monitor import wait_for_trade_completion
 from csv_writer import update_close_data_in_csv
 from logger import get_logger
 from util import format_datetime
-from position import get_positions, get_positions_strict
+from position import (
+    get_positions, get_positions_strict,
+    get_positions_strict_with_retry, PositionSnapshotError,
+)
 
 ESTIMATED_COMMISSION_RATE = 0.0035
 CLOSE_RETRY_DELAY = 10
@@ -162,9 +165,21 @@ class CloseManager:
                     #   sell 平多：目标仓 = 多头 (live>0)
                     target_still_open = (live < 0) if close_action == 'buy' else (live > 0)
                     if not target_still_open:
+                        # 【2026-09-27 修复】重试前复核发现目标方向仓位已不存在
+                        # （前单延迟成交/fake-Cancelled 落账）→ 停止补单防双重平仓，
+                        # 同时**按实际成交补记平仓账**：账户已无该方向持仓 =
+                        # 账上未平开仓批次必然已全部成交。
+                        # 旧行为：直接 return True 不写账，缺口留给退出补写
+                        # （而退出补写当时还有第2条缺陷，事件流路径无测试覆盖）。
+                        booked = await self._book_close_confirmed_flat(
+                            ib, account, symbol, close_action, volume, open_price,
+                            open_action, csv_path,
+                            target_lot_id=target_lot_id, strategy=strategy,
+                            reason=reason or '重试前复核已平：按实际成交补记')
                         self.logger.info(
                             f"🔍 {symbol}: 重试前目标方向持仓已不存在 (当前 {live:+d}股，"
                             f"可能已被前单延迟成交) —— 停止补单，防止双重平仓"
+                            f"（平仓账已按实际成交补记 {booked}股）"
                         )
                         return True
                     live_vol = abs(live)
@@ -188,6 +203,98 @@ class CloseManager:
         self.logger.error(f"❌ {symbol}: 平仓重试 {CLOSE_MAX_RETRIES} 次后仍失败")
         return False
 
+    async def _book_close_confirmed_flat(self, ib: IB, account: str, symbol: str,
+                                         close_action: str, volume: int, open_price: float,
+                                         open_action: str, csv_path,
+                                         target_lot_id: str = '', strategy: str = '',
+                                         reason: str = '') -> int:
+        """重试前复核"已平"的平仓账补记（2026-09-27）
+
+        背景：前单部分成交后重试，重试前持仓复核发现目标方向仓位已不存在
+        （前单延迟成交 / fake-Cancelled 落账）→ 停止补单防双重平仓。
+        旧行为到此直接成功返回**不写平仓账**，账本缺口只能等退出补写兜底。
+        本方法把补账前置到"已平确认"的当下：
+
+        - 补记量 = 该账户该标的**账上未平开仓批次全部余量**（账户已无该方向
+          持仓 = 这批未平必然已全部成交；不按原计划量、也不按已见 fills 量）；
+        - 价格 = 最近一单的实际成交均价（_last_trade 的 avgFillPrice/fills），
+          无实际成交信息时退回开仓价并 WARNING（延迟落账部分的价格以
+          Client Portal 为准，人工核对）；
+        - 账上无未平批次（已入账过）→ 幂等返回 0，绝不重复补记。
+
+        Returns:
+            int: 实际补记股数（无未平批次/补记失败 → 0）
+        """
+        price = 0.0
+        trade = getattr(self, '_last_trade', None)
+        if trade is not None:
+            try:
+                price = float(get_fill_price(trade) or 0.0)
+            except Exception:
+                price = 0.0
+        if price <= 0:
+            price = float(open_price)
+            self.logger.warning(
+                f"⚠️ {symbol}: 补记平仓价无实际成交信息（无 trade / avgFillPrice）—— "
+                f"暂按开仓价 ${price:.4f} 补记，请以 Client Portal 实际成交价人工核对")
+
+        # ==================== 事件流路径 ====================
+        if self.trade_store is not None:
+            store_account = 'account1' if ib is self.ib1 else 'account2'
+            try:
+                remaining_lot = sum(int(l['remaining'])
+                                    for l in self.trade_store.get_open_lots(store_account, symbol))
+            except Exception as e:
+                self.logger.critical(f"🚨 {symbol}: 已平补账读取未平批次失败: {e} —— 请人工补记账")
+                return 0
+            if remaining_lot <= 0:
+                self.logger.info(f"🔍 {symbol}: 账上已无未平批次（应已入账）—— 不重复补记")
+                return 0
+            try:
+                ok = self.trade_store.append_close(
+                    account=store_account, symbol=symbol,
+                    close_action=close_action, volume=remaining_lot, price=price,
+                    event_datetime=datetime.datetime.now(),
+                    target_lot_id=target_lot_id or None,
+                    strategy=strategy or 'reconcile',
+                    reason=reason or '重试前复核已平：按实际成交补记',
+                    reconcile=True)
+            except Exception as e:
+                self.logger.critical(f"🚨 {symbol}: 已平补账写事件流失败: {e} —— 请人工补记账")
+                return 0
+            if ok:
+                self.logger.info(
+                    f"✅ {symbol}: 重试前复核已平 → 平仓账已补记 {remaining_lot}股 @ ${price:.4f}"
+                    f"（账户已无该方向持仓 = 未平批次必然全部成交）")
+            else:
+                self.logger.critical(f"🚨 {symbol}: 已平补账无可扣减的开仓批次（账本缺口）—— 请人工补记账")
+                return 0
+            return remaining_lot
+
+        # ==================== 旧 CSV 路径 ====================
+        if csv_path is None:
+            self.logger.critical(
+                f"🚨 {symbol}: 确认已平但该标的无开仓记录可回写（残留仓场景）—— 请人工登记核对")
+            return 0
+        close_vol = max(1, int(volume))
+        close_fund = price * close_vol
+        open_fund = float(open_price) * close_vol
+        gross_profit = (open_fund - close_fund) if open_action == 'sell' else (close_fund - open_fund)
+        profit = gross_profit - (volume + close_vol) * ESTIMATED_COMMISSION_RATE
+        close_data = {
+            'close_datetime': format_datetime(datetime.datetime.now()),
+            'close_price': round(price, 4),
+            'close_vol': close_vol,
+            'close_fund': round(close_fund, 2),
+            'gross_profit': round(gross_profit, 2),
+            'profit': round(profit, 2),
+        }
+        if update_close_data_in_csv(csv_path, symbol, open_action, close_data):
+            self.logger.info(f"✅ {symbol}: 重试前复核已平 → 平仓账已补记 {close_vol}股 @ ${price:.4f}（旧CSV）")
+            return close_vol
+        self.logger.critical(f"🚨 {symbol}: 已平补账更新CSV失败 —— 请人工补记账")
+        return 0
+
     async def _execute_close(self, ib: IB, symbol: str, close_action: str,
                              volume: int, open_price: float, open_action: str, csv_path,
                              target_lot_id: str = '', strategy: str = '',
@@ -205,9 +312,21 @@ class CloseManager:
         trade = await submit_buy_order(ib, symbol, volume) if close_action == 'buy' else await submit_sell_order(
             ib, symbol, volume)
         if not trade:
+            self._last_trade = None
             return False
 
-        status = await wait_for_trade_completion(trade, timeout_seconds=120)
+        # 供"重试前复核已平"分支按实际成交补记平仓账（价格取该单实际成交均价）
+        self._last_trade = trade
+
+        # 【统一"等订单完成"】wait_for_trade_completion 已于 2026-09-27 升级为
+        # monitor.wait_for_order_final 语义：等全量成交或订单终态才结算，
+        # 部分成交+仍在工作不再提前返回（旧行为会让下面的"部分成交"分支
+        # 误撤仍在工作的剩余挂单 —— 市价单分笔成交时的竞态根因）
+        # 【2026-09-28 强平提速】强平模式每笔等待 120s→60s：
+        # 单标的从最坏 ~4.2 分钟（120+10+120）降到 ~2.2 分钟（60+10+60），
+        # 第二/三轮才能在收盘前落进可成交窗口（2026-09-21 15:55 起强平
+        # 拖过 16:00、收盘后 40 分钟空转的审查发现）。
+        status = await wait_for_trade_completion(trade, timeout_seconds=60 if force else 120)
 
         if status != 'Filled':
             self.logger.error(f"❌ {symbol}: 平仓订单未成交 (状态: {status})")
@@ -221,12 +340,11 @@ class CloseManager:
         close_vol = get_filled_volume(trade)
 
         # ==================== 核心规则：部分成交 ≠ 平仓完成 ====================
-        # wait_for_trade_completion 只要"有任何成交"就返回 Filled（首笔成交消息即触发），
-        # 此时订单可能仍在工作（只成交了一部分）。若据此把该行 CSV 标记为已平仓，
-        # 剩余部分在收市附近未被成交（被市场取消/拒绝）就会形成
-        # "CSV 显示已平仓、账户仍有持仓" 的错账。
-        # 因此：未全部成交一律视为"未平仓"——撤销尚在工作的工作单，
-        # 交回重试/下一轮按实况数量补平，绝不提前写 CSV。
+        # 【2026-09-27】wait 已升级：到达这里时订单要么**终态**（部分成交+Cancelled，
+        # 剩余量已死，下面 cancel 为无操作幂等），要么**超时**（仍在工作 → 撤剩余挂单）。
+        # 旧竞态（部分成交+仍工作即被判"未平"并撤杀剩余量）已随统一 wait 消除。
+        # 规则不变：未全部成交一律视为"未平仓"——绝不提前写 CSV，
+        # 交回重试/下一轮按实况数量补平（重试前复核已平 → 按实际成交补记账）。
         if close_vol < volume:
             self.logger.warning(
                 f"⚠️ {symbol}: 仅部分成交 {close_vol}/{volume}股 —— 视为未平仓"
@@ -334,7 +452,8 @@ class CloseManager:
         finally:
             self.force_close_active = False
 
-    async def force_close_until_flat(self, timeout_minutes: int = 10) -> bool:
+    async def force_close_until_flat(self, timeout_minutes: int = 10,
+                                     close_deadline: datetime.datetime = None) -> bool:
         """
         强制平仓循环（收敛保证版）
 
@@ -344,13 +463,21 @@ class CloseManager:
           双重成交造成，或前日遗留仓如EOSE）→ 平仓并记CRITICAL，不写CSV。
         如此循环，无论TWS延迟成交如何乱序，都会逐轮收敛到两账户全平。
 
+        Args:
+            timeout_minutes: 本方法的总时限上限（秒级安全边界，默认 10 分钟）；
+            close_deadline: **绝对**收盘时刻（naive 本地时区，须与 datetime.now() 同基准）。
+                到达即停止开下一轮并返回 False——收盘后普通市价单无法再成交，
+                继续重试只会空转。传 None 时退化为仅 timeout_minutes 上限（测试/兜底）。
+
         Returns:
-            bool: True=全部清仓完成; False=超时仍有残留
+            bool: True=全部清仓完成; False=到达时限/收盘仍有残留
         """
         # 进入强制平仓窗口：运行时策略让路（runner.stop() 由 hedge_trade 在调用前触发）
         self.force_close_active = True
         try:
             deadline = datetime.datetime.now() + datetime.timedelta(minutes=timeout_minutes)
+            if close_deadline is not None:
+                deadline = min(deadline, close_deadline)
             attempt = 0
             while datetime.datetime.now() < deadline:
                 attempt += 1
@@ -386,12 +513,30 @@ class CloseManager:
                 )
 
                 await self._force_close_positions(pos1, pos2)
-                await asyncio.sleep(CLOSE_CHECK_INTERVAL)
 
-            self.logger.critical(
-                f"🚨 平仓超时（{timeout_minutes}分钟），未清仓 —— 可能仍有残留持仓"
-                f"（含反向残留），请立即人工核对TWS两个账户"
-            )
+                # 【2026-09-28 收盘即停】每轮结束先查是否已到收盘：
+                # 已到收盘则不再开下一轮（收盘后普通市价单无法再成交，继续只会空转）
+                now = datetime.datetime.now()
+                if close_deadline is not None and now >= close_deadline:
+                    self.logger.critical(
+                        "🚨 已到收盘（收盘后普通市价单无法再成交）—— 停止重试，转人工"
+                    )
+                    break
+                # 收尾睡眠不越过 deadline，避免把强平窗口拖出收盘/时限
+                remaining = (deadline - now).total_seconds()
+                await asyncio.sleep(max(0.0, min(CLOSE_CHECK_INTERVAL, remaining)))
+
+            if close_deadline is not None and \
+                    datetime.datetime.now() >= close_deadline - datetime.timedelta(seconds=1):
+                self.logger.critical(
+                    "🚨 收盘仍未清仓（可能停牌/流动性差）—— 收盘后不再重试，请立即人工核对"
+                    "TWS两个账户并手动平仓，勿留隔夜仓位！"
+                )
+            else:
+                self.logger.critical(
+                    f"🚨 平仓超时（{timeout_minutes}分钟），未清仓 —— 可能仍有残留持仓"
+                    f"（含反向残留），请立即人工核对TWS两个账户"
+                )
             return False
         finally:
             self.force_close_active = False
@@ -480,19 +625,37 @@ class CloseManager:
 
         # 刷新持仓，确认是否真的全部平仓（用权威快照，不用长寿命缓存）
         # 关键：取数失败必须如实报错，绝不能静默当成"0持仓"而宣称"已全部平仓"
+        # 【2026-09-22 硬化】snap_failed=True 时下面"空 remaining"不可信——
+        # 下游补写据此【整账户禁用】"记已平"（旧版失败后 remaining={} 仍照常补写，
+        # 强平失败的残留仓位会被补记成已平）。重试版降低退出时点抖动误判。
+        snap_failed = False
         try:
-            snap1 = await get_positions_strict(self.ib1, self.account1)
-            snap2 = await get_positions_strict(self.ib2, self.account2)
+            snap1 = await get_positions_strict_with_retry(self.ib1, self.account1)
+            snap2 = await get_positions_strict_with_retry(self.ib2, self.account2)
             remaining1 = {s: v['position'] for s, v in snap1.items() if v['position'] != 0}
             remaining2 = {s: v['position'] for s, v in snap2.items() if v['position'] != 0}
         except Exception as e:
+            snap_failed = True
             self.logger.critical(
                 f"🚨 退出前持仓终态确认失败: {e} —— 无法确认两账户是否真正清仓，"
-                f"请立即人工核对TWS两个账户的持仓!"
+                f"本次退出不补记任何'已平'，请立即人工核对TWS两个账户的持仓!"
             )
             remaining1, remaining2 = {}, {}
 
-        if remaining1 or remaining2:
+        if snap_failed:
+            # CRITICAL 已在取数失败处给出；"已清仓"判定不成立，禁止宣称 ✅
+            # 【2026-09-27 硬化】终态持仓未知时，**任何路径**都不得补记"已平"：
+            # 事件流路径已由 holding_symbols=None 整账户禁用，但旧 CSV 兜底路径
+            # (_backfill_csv) 此前仍会仅凭 fills 把账上全部未平行标记为已平——
+            # 即"取数失败后仍把账本强制成两账户0持仓"（实际可能仍有残留仓）。
+            # 统一口径：到此直接结束，留给"退出前持仓终态确认失败"的人工核查。
+            self.logger.critical(
+                "🚨 退出补写整体取消（事件流 + 旧CSV 双路径）—— 终态持仓快照不可用，"
+                "无法确认任何标的已清仓，禁止把账本补记成'两账户0持仓'；"
+                "请立即人工核对TWS两账户实际持仓后再入账!"
+            )
+            return
+        elif remaining1 or remaining2:
             d1 = ', '.join(f"{sname} {'+' if v > 0 else ''}{v}股" for sname, v in remaining1.items())
             d2 = ', '.join(f"{sname} {'+' if v > 0 else ''}{v}股" for sname, v in remaining2.items())
             self.logger.critical(
@@ -517,8 +680,12 @@ class CloseManager:
         if self.trade_store is not None:
             # ==================== 事件流回填（新路径） ====================
             # 账户1 平仓 = BUY 方向成交；账户2 平仓 = SELL 方向成交
-            p1 = self._backfill_store_account('account1', fills1, 'BUY')
-            p2 = self._backfill_store_account('account2', fills2, 'SELL')
+            # 【守卫】holding = 严格快照确认仍持仓的标的集合（事实）；
+            #         snap_failed → None = 该账户无法确认任何标的已平 → 全部禁止"记已平"
+            hold1 = None if snap_failed else set(remaining1.keys())
+            hold2 = None if snap_failed else set(remaining2.keys())
+            p1 = self._backfill_store_account('account1', fills1, 'BUY', holding_symbols=hold1)
+            p2 = self._backfill_store_account('account2', fills2, 'SELL', holding_symbols=hold2)
             self.logger.info(f"✅ 事件流补写完成: account1 {p1} 行, account2 {p2} 行")
             return
 
@@ -579,8 +746,13 @@ class CloseManager:
             try:
                 if normalize_side(f.execution.side) != normalize_side(close_side):
                     continue
+                # 【只算股票】账户里同名期权/期货的成交不得计入该股票的平仓量
+                # （fills 仅按 symbol 匹配时，期权成交会污染 R9 覆盖校验与均价）
+                c = getattr(f, 'contract', None)
+                if (getattr(c, 'secType', None) or 'STK') != 'STK':
+                    continue
                 shares = abs(int(float(f.execution.shares)))
-                sym = getattr(getattr(f, 'contract', None), 'symbol', None)
+                sym = getattr(c, 'symbol', None)
             except Exception:
                 continue
             if not sym or shares <= 0:
@@ -605,16 +777,16 @@ class CloseManager:
             planned = self._planned_close_by_symbol(account)
             if not planned:
                 continue
-            got = self._fills_total_by_symbol(fills, side)
+            got = self._unbooked_have_by_symbol(account, fills, side)
             for sym, need in sorted(planned.items()):
                 have = got.get(sym, 0)
                 if have < need:
-                    short.append(f"{account}[{sym}] fills {have} < 计划平仓 {need}")
+                    short.append(f"{account}[{sym}] 未入账fills {have} < 计划平仓 {need}")
         if not short:
             return fills1, fills2
 
         self.logger.warning(
-            f"⚠️ [R9] 收盘方向 fills 不足: {'; '.join(short)} —— "
+            f"⚠️ [R9] 收盘方向未入账 fills 不足: {'; '.join(short)} —— "
             f"等待 {FILLS_COVERAGE_RETRY_SECONDS} 秒后重取一次"
         )
         await asyncio.sleep(FILLS_COVERAGE_RETRY_SECONDS)
@@ -631,17 +803,37 @@ class CloseManager:
             if not planned:
                 continue
             src = fills1 if account == 'account1' else fills2
-            got = self._fills_total_by_symbol(src, side)
+            got = self._unbooked_have_by_symbol(account, src, side)
             still = [f"{sym} {got.get(sym, 0)}/{need}"
                      for sym, need in sorted(planned.items()) if got.get(sym, 0) < need]
             if still:
                 self.logger.error(
-                    f"🚨 [R9] 重取后收盘方向 fills 仍不足: {'; '.join(still)} —— "
-                    f"回填将按实际到手的 fills 执行，请人工核对账本"
+                    f"🚨 [R9] 重取后收盘方向未入账 fills 仍不足: {'; '.join(still)} —— "
+                    f"回填将按实际到手的 fills 执行（并受'仍持仓不记已平'守卫），请人工核对账本"
                 )
             else:
-                self.logger.info(f"✅ [R9] {account} 收盘方向 fills 已充足")
+                self.logger.info(f"✅ [R9] {account} 收盘方向未入账 fills 已充足")
         return fills1, fills2
+
+    def _unbooked_have_by_symbol(self, account: str, fills, close_side: str) -> dict:
+        """【2026-09-22】按标的的【未入账】收盘方向成交股数
+
+        = max(0, 会话同方向 fills 总量 − 当日已入账平仓量)。
+        旧版用"全天同方向 fills"当 have，已被入账的旧成交（如早上收敛循环
+        卖出的超额部分）会把"未到货的新 fills"凑够数 → R9 覆盖校验形同虚设。
+        """
+        totals = self._fills_total_by_symbol(fills, close_side)
+        if not totals or self.trade_store is None:
+            return {k: int(v) for k, v in totals.items()}
+        today = datetime.date.today()
+        out = {}
+        for sym, vol in totals.items():
+            try:
+                booked = int(self.trade_store.close_volume_since(account, sym, today))
+            except Exception:
+                booked = 0
+            out[sym] = max(0, int(vol) - booked)
+        return out
 
     def _resolve_close_time(self, sym_fills, symbol: str) -> str:
         """解析平仓入账时间（美东时间字符串）——时区加固，新旧路径共用
@@ -681,12 +873,30 @@ class CloseManager:
                 )
         return exec_utc.astimezone(_EST_TZ).strftime('%Y-%m-%d %H:%M:%S')
 
-    def _backfill_store_account(self, account: str, fills, close_side: str) -> int:
-        """退出前事件流回填：按该账户每只股票的未平批次，把平仓成交分配写入平仓事件
+    def _backfill_store_account(self, account: str, fills, close_side: str,
+                                holding_symbols=None) -> int:
+        """退出前事件流回填：只把【未入账的平仓成交】写入平仓事件（2026-09-22 硬化）
 
+        旧版三个"还拿着仓位却记成已平"的缺陷（已修）：
+        1) 补记数量恒为全部未平批次（remaining_to_close = remaining），不按实际成交封顶
+           —— 强平失败时，只要当天有过同方向成交，残留仓位就会被补记成"已平"；
+        2) 成交总量/均价按"全天同方向的所有成交"计算，包含当日已入账的平仓
+           （如收敛循环同轮超平卖出）→ 数量与均价双污染、"成交>未平批次"误报；
+        3) 账户仍持仓（强平失败/残留）也照常补记"已平"。
+
+        新版规则（每账户每标的）：
+        - 【守卫】holding_symbols 为严格快照确认"仍持仓"的标的集合：
+          * None = 快照取数失败，无法确认任何标的已平 → **整账户禁止补记"已平"**；
+          * 集合内标的 → 不补记、只 CRITICAL（残留仓位，人工处理）。
+        - 【去重】未入账成交 = max(0, 会话同方向 fills − 当日已入账平仓量)
+          （execId 去重的数量等价：账本平仓行即"已入账"证据，不扩 CSV 列）。
+        - 【封顶】补记量 = min(未入账成交, 未平批次)；
+          未入账 > 未平（重复成交/延迟开仓）→ 只记未平部分并 CRITICAL；
+          未入账 < 未平（跨日延迟入账等）→ 只记可证明部分并 CRITICAL。
+        - 【价格】只用"未入账部分"的成交定价（按成交时间取最近 unbooked 股，
+          早前的成交视为已入账），均价不再混新旧。
         - 每批一行（related_lot_id 关联），event_type=RECONCILE，strategy=reconcile；
-        - 平仓成交 > 未平批次（延迟开仓成交场景）→ 只记未平部分并 CRITICAL 告警；
-        - 入账时间沿用 _resolve_close_time 的时区加固逻辑（与旧路径一致）。
+          入账时间沿用 _resolve_close_time 的时区加固逻辑（与旧路径一致）。
         """
         store = self.trade_store
         close_action = 'buy' if account == 'account1' else 'sell'
@@ -694,6 +904,16 @@ class CloseManager:
         patched = 0
         if not Path(account_dir).exists():
             return 0
+
+        if holding_symbols is None:
+            # 严格快照失败 → 无法确认任何标的已清仓 → 本账户一律不补记"已平"
+            self.logger.critical(
+                f"🚨 {account}: 退出补写整体禁用 —— 终态持仓快照失败，"
+                f"无法确认任何标的已清仓；请人工核对 TWS 持仓后再手工入账（避免把残留仓位记成已平）"
+            )
+            return 0
+
+        today = datetime.date.today()
 
         for stock_csv in sorted(Path(account_dir).glob('*.csv')):
             symbol = stock_csv.stem
@@ -704,14 +924,27 @@ class CloseManager:
                 continue
             if not lots:
                 continue
+            remaining = sum(int(l['remaining']) for l in lots)
+            if remaining <= 0:
+                continue
 
-            # 汇总该股票平仓方向成交
-            close_fills = []
+            # 【守卫】该标的账户仍持仓（强平失败/残留）→ 绝不能记"已平"
+            if symbol in holding_symbols:
+                self.logger.critical(
+                    f"🚨 {symbol} ({account}): 账户仍持有实际持仓（严格快照确认），"
+                    f"账本尚有未平批次 {remaining}股 —— 平仓并未真正完成，"
+                    f"本次不补记'已平'，请立即人工处理该仓位!"
+                )
+                continue
+
+            # 汇总该标的会话内收盘方向成交（含当日已入账的，稍后扣除）
+            day_fills = []
             total_fill = 0
-            fill_cost = 0.0
             for f in fills:
                 if normalize_side(f.execution.side) != normalize_side(close_side):
                     continue
+                if (getattr(f.contract, 'secType', None) or 'STK') != 'STK':
+                    continue  # 【只算股票】同名期权/期货成交不得计入该股票平仓
                 if f.contract.symbol != symbol:
                     continue
                 try:
@@ -720,30 +953,86 @@ class CloseManager:
                     continue
                 if sh <= 0:
                     continue
-                close_fills.append(f)
+                day_fills.append(f)
                 total_fill += sh
-                try:
-                    fill_cost += sh * float(f.execution.price)
-                except Exception:
-                    pass
             if total_fill <= 0:
+                self.logger.critical(
+                    f"🚨 {symbol} ({account}): 账户已确认清仓、账本还有未平批次 {remaining}股，"
+                    f"但会话内无同方向成交 —— 该批平仓可能跨日延迟入账（成交不在当日会话），"
+                    f"未自动补记，请人工核对 Client Portal 成交明细后手工入账!"
+                )
                 continue
 
-            avg_price = (fill_cost / total_fill) if total_fill else 0.0
-            remaining = sum(int(l['remaining']) for l in lots)
-            if total_fill > remaining:
+            # 【去重】未入账成交 = 会话同方向 fills − 当日已入账平仓量
+            try:
+                booked_today = int(store.close_volume_since(account, symbol, today))
+            except Exception as e:
+                self.logger.warning(
+                    f"⚠️ {symbol}: 统计当日已入账平仓量失败: {e} —— "
+                    f"去重按 0 处理（'仍持仓不记已平'守卫兜底）"
+                )
+                booked_today = 0
+            unbooked = max(0, total_fill - booked_today)
+
+            bookable = min(unbooked, remaining)
+            if bookable <= 0:
                 self.logger.critical(
-                    f"🚨 {symbol} ({account}): 退出回填平仓成交 {total_fill}股 > 未平批次 {remaining}股 —— "
-                    f"可能有延迟开仓成交，账本只记 {remaining}股，请立即核对账户实际持仓!"
+                    f"🚨 {symbol} ({account}): 会话同方向成交 {total_fill}股 已全部入账（当日已入账 {booked_today}股），"
+                    f"未平批次 {remaining}股 无可补记成交 —— 请人工核对账本!"
+                )
+                continue
+            if unbooked > remaining:
+                self.logger.critical(
+                    f"🚨 {symbol} ({account}): 未入账平仓成交 {unbooked}股 > 未平批次 {remaining}股（会话成交 {total_fill} − 已入账 {booked_today}）—— "
+                    f"可能有重复成交/延迟开仓，账本只记 {remaining}股，请立即核对账户实际持仓!"
+                )
+            elif bookable < remaining:
+                # 账户已确认清仓但未入账 fills 不足以覆盖未平批次 → 缺口必须显式升级
+                self.logger.critical(
+                    f"🚨 {symbol} ({account}): 账户已确认清仓，但未入账 fills 仅 {unbooked}股 < 未平批次 {remaining}股"
+                    f"（会话成交 {total_fill} − 已入账 {booked_today}）—— 账本只记 {bookable}股，"
+                    f"缺口 {remaining - bookable}股 需人工核对 Client Portal 成交明细后入账!"
                 )
 
-            dt_str = self._resolve_close_time(close_fills, symbol)
+            # 【价格纯净】按成交时间取最近的 unbooked 股（更早的视为已入账）
+            def _t_utc(f):
+                u = _to_utc_instant(getattr(getattr(f, 'execution', None), 'time', None))
+                return u if u is not None else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
 
-            remaining_to_close = remaining
+            ordered = sorted(day_fills, key=_t_utc)
+            selected = []
+            left = bookable
+            for f in reversed(ordered):
+                if left <= 0:
+                    break
+                sh = abs(int(float(f.execution.shares)))
+                if sh <= 0:
+                    continue
+                selected.append(min(left, sh))
+                left -= min(left, sh)
+            sel_shares = sum(selected)
+            # 与 selected 对应的成交（同序）定价
+            sel_fills = [f for f in reversed(ordered)]
+            sel_cost = 0.0
+            for i, f in enumerate(sel_fills):
+                if i >= len(selected):
+                    break
+                try:
+                    sel_cost += selected[i] * float(f.execution.price)
+                except Exception:
+                    pass
+            avg_price = (sel_cost / sel_shares) if sel_shares else 0.0
+
+            # 入账时点 = 所选"未入账成交"中最新一笔（_resolve_close_time 内部取 max）
+            dt_str = self._resolve_close_time(ordered[-len(selected):], symbol)
+
+            remaining_to_close = bookable
             for lot in lots:
                 if remaining_to_close <= 0:
                     break
                 alloc = min(remaining_to_close, int(lot['remaining']))
+                if alloc <= 0:
+                    continue
                 ok = store.append_close(
                     account=account, symbol=symbol, close_action=close_action,
                     volume=alloc, price=avg_price, event_datetime=dt_str,
@@ -755,7 +1044,7 @@ class CloseManager:
                     patched += 1
                     self.logger.info(
                         f"📝 补写: {symbol} ({account}) {lot['lot_id']} | "
-                        f"平仓 {alloc}股 @ ${avg_price:.4f}"
+                        f"平仓 {alloc}股 @ ${avg_price:.4f}（未入账成交部分，去重: 会话{total_fill} − 已入账{booked_today}）"
                     )
                 remaining_to_close -= alloc
         return patched

@@ -56,6 +56,16 @@ class StrategyRunner:
         # 每只标的的最早建仓时间（用于跳过建仓前的历史 bar），统一为美东 aware
         self.entry_times: dict = {}
 
+        # 【2026-09-27 修复：开盘第一根 bar 永久丢失】
+        # bar 事件是一次性消费（realtime 每个 bar 下标只处理一次，后续 tick 不再触发），
+        # 旧代码在 `now < activate_at` 时直接 return —— 开盘第一/二根 bar 若在该时刻前
+        # 到达（确认时点 ~09:30:20 与激活时刻 ~09:31:00 之间，账户2收敛尚未结束、
+        # TWS 历史回放先落地），就被永久跳过，开盘窗口特殊策略的 bar1 判定永远不成立。
+        # 现在：激活前到达的 bar 进入等待队列，激活到点后立即按序补评估（不丢弃）。
+        self._early_bars: list = []
+        self._bar_lock = asyncio.Lock()
+        self._early_flush_scheduled = False
+
     # ------------------------------------------------------------------
     # 时区归一化
     # ------------------------------------------------------------------
@@ -105,6 +115,10 @@ class StrategyRunner:
         else:
             activate_at = now + datetime.timedelta(seconds=delay_seconds)
             mode = f"延迟 {delay_seconds} 秒"
+        # 新一轮激活周期从干净状态开始：清掉上一周期遗留的早到 bar 与定时任务，
+        # 防止跨周期把过期行情补评估进新状态
+        self._early_bars.clear()
+        self._early_flush_scheduled = False
         self.active = True
         self.activate_at = activate_at
         self.logger.info(
@@ -211,12 +225,74 @@ class StrategyRunner:
         self.strategy.on_entry(symbol, account, price, volume, dt)
 
     async def on_bar(self, bar: Bar) -> None:
-        """每根新 1 分钟 bar 调用"""
+        """每根新 1 分钟 bar 调用
+
+        【2026-09-27 修复：开盘第一根 bar 永久丢失】bar 事件是一次性消费
+        （realtime 处理器对每个 bar 下标只处理一次，后续 tick 更新不再触发）——
+        旧代码在 `now < activate_at` 时直接 return 丢弃：开盘第一/二根 bar 若在
+        激活时刻前到达（确认时点 ~09:30:20 与激活时刻 ~09:31:00 之间，账户2收敛
+        尚未结束、TWS 历史回放先落地），开盘窗口内这条 bar 就永远没有参与判断，
+        开盘特殊策略的 bar1 判定永远不成立。
+        现在：激活前到达的 bar 进入早到队列，激活到点后立即按序补评估，不丢弃。
+        """
         if not self.active:
             return
-        if self.activate_at and datetime.datetime.now() < self.activate_at:
-            return
+        async with self._bar_lock:
+            if self.activate_at and datetime.datetime.now() < self.activate_at:
+                self._enqueue_early_bar(bar)
+                return
+            await self._drain_early_bars()   # （需在持锁状态下调用）
+            await self._evaluate_bar(bar)
 
+    def _enqueue_early_bar(self, bar: Bar) -> None:
+        """激活前到达的 bar 入队等待（按 (symbol, dt) 去重，防重放重复入队）"""
+        for b in self._early_bars:
+            if b.symbol == bar.symbol and b.dt == bar.dt:
+                return
+        self._early_bars.append(bar)
+        self.logger.info(
+            f"⏸️ [{bar.symbol}] bar(dt={bar.dt.strftime('%H:%M:%S')}) 在策略激活前到达 —— "
+            f"排队等待（激活到点后立即按序补评估，不再直接跳过）"
+        )
+        if not self._early_flush_scheduled and self.activate_at is not None:
+            self._early_flush_scheduled = True
+            try:
+                asyncio.ensure_future(self._flush_early_bars())
+            except RuntimeError as e:
+                # 兜底：即使定时任务没排上，下一根 bar 事件进入 on_bar 时也会立即冲刷
+                self.logger.error(f"❌ 无法调度早到 bar 冲刷任务（将由下一根 bar 事件触发冲刷）: {e}")
+
+    async def _flush_early_bars(self) -> None:
+        """激活到点 → 按序冲刷早到队列（下一根 bar 事件的 on_bar 同样会冲刷）"""
+        try:
+            now = datetime.datetime.now()
+            if self.activate_at is not None and now < self.activate_at:
+                await asyncio.sleep((self.activate_at - now).total_seconds())
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            self.logger.warning(f"⚠️ 早到 bar 冲刷等待异常（改由 bar 事件触发冲刷）: {e}")
+            return
+        async with self._bar_lock:
+            await self._drain_early_bars()
+
+    async def _drain_early_bars(self) -> None:
+        """冲刷早到队列（调用方须已持有 _bar_lock）：按入队顺序补评估，单根异常隔离"""
+        early = list(self._early_bars)
+        if not early:
+            return
+        self._early_bars.clear()
+        self._early_flush_scheduled = False
+        self.logger.info(f"▶️ 激活时刻已到 —— 按序补评估 {len(early)} 根激活前早到的 bar")
+        for b in early:
+            try:
+                await self._evaluate_bar(b)
+            except Exception as e:
+                self.logger.error(
+                    f"❌ 早到 bar 补评估异常 [{b.symbol}] dt={b.dt}: {e}", exc_info=True)
+
+    async def _evaluate_bar(self, bar: Bar) -> None:
+        """单根 bar 的实际评估：建仓门控 → 权威持仓 → 策略 → 信号执行（原 on_bar 主体）"""
         # 【R5 标的级暂停】不再整根跳过 bar（旧逻辑会把开盘窗口 bar1 的判定整根丢弃）；
         # 暂停只作用于"信号执行"：被暂停标的照常评估（策略状态/极值正常更新），
         # 信号排队、本轮解除暂停时重放。见 _queue_paused_signals / replay_paused_signals。

@@ -11,8 +11,6 @@ from models import StockInfo
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from ib_async import util
-
 from config import (
     TWS_HOST, ACCOUNT1_PORT, ACCOUNT1_CLIENT_ID,
     ACCOUNT2_PORT, ACCOUNT2_CLIENT_ID, DB_URL, BASE_RUNTIME_DIR,
@@ -36,13 +34,79 @@ from trade_store import TradeStore
 from hedge import (
     pre_submit_sell_orders, confirm_short_positions,
 )
-from position import reconcile_positions, get_positions, PositionSnapshotError
+from position import (
+    reconcile_positions, get_positions_strict_with_retry, PositionSnapshotError,
+)
 from realtime import RealtimeDataRecorder
 from close import CloseManager  # 新增导入
+from reconnect import IBReconnector, sync_after_reconnect  # 2026-09-28 断线自动重连
 
 # 【新增】策略系统
 from strategy import DynamicTPStrategy, OpenWindowStrategy
 from strategy_runner import StrategyRunner
+
+
+def derive_close_deadlines(close_time: str) -> tuple:
+    """由 TWS 收盘时间(HH:MM, 美东)推导 (close_dt, force_close_dt) 美东时刻
+
+    【2026-09-27 修复：收盘时间解析失败后主循环永不强平】
+    旧代码解析失败时 close_dt/force_close_dt 均为 None，主循环的条件
+    `if force_close_dt and now_est >= force_close_dt` 因此**永远不成立**——
+    程序会永远跑下去、绝不到 15:50 的强制平仓点（收盘后空仓过夜）。
+    现在：解析失败（含空串/异常格式）一律回退到默认 15:30（美东）收盘，
+    记 CRITICAL 告警，保证 force_close_dt 永远存在且有效。
+    """
+    logger = get_logger()
+    now_est = get_current_time_est()
+    close_dt = None
+    try:
+        hhmm = str(close_time or '').strip()
+        # 取前两段，兼容 "16:00" / "16:00:10" 等格式
+        close_hour, close_minute = map(int, hhmm.split(':')[:2])
+        if not (0 <= close_hour <= 23 and 0 <= close_minute <= 59):
+            raise ValueError(f"收盘时间超出合法范围: {close_time!r}")
+        close_dt = now_est.replace(hour=close_hour, minute=close_minute,
+                                   second=0, microsecond=0)
+    except Exception as e:
+        logger.critical(
+            f"🚨 解析收盘时间失败 (close_time={close_time!r}): {e} —— "
+            f"回退默认 15:30（美东）收盘设定强平价期限，"
+            f"请人工核对该交易日实际交易时段!"
+        )
+        close_dt = now_est.replace(hour=15, minute=30, second=0, microsecond=0)
+    force_close_dt = close_dt - datetime.timedelta(minutes=10)
+    logger.info(
+        f"⏰ 强制平仓触发时间设定为: {force_close_dt.strftime('%H:%M:%S')} 美东时间"
+        f"（收市前10分钟；收盘 {close_dt.strftime('%H:%M:%S')} 起不再重试、转人工）"
+    )
+    return close_dt, force_close_dt
+
+
+def _decide_exit_mode(pos_ok: bool, pos1: dict, pos2: dict) -> str:
+    """阶段8"是否进入盯盘 + 收市强平"的门槛判定（2026-09-22 硬化）
+
+    背景缺陷：旧代码用宽松版 get_positions，请求一失败就返回 {}，
+    于是"实际对冲=0"→ 走"TWS中无实际对冲持仓，跳过平仓管理"分支直接断开退出。
+    后果：TWS 一次抖动，当天全部对冲仓位就无人盯盘、不强制平仓，留到隔夜。
+
+    判定规则（顺序即优先级）：
+      1. pos_ok=False —— 任一账户快照多次重试仍失败（"空"未被确认）。
+         此时"空持仓"不可信，**必须**走盯盘 + 强平流程，绝不带仓早退。
+             → 'defensive'
+      2. 任一账户有任何持仓（pos1 或 pos2 非空）—— 正常盯盘 + 强平，
+         含"单边持仓"（对冲不对称）情形，仍须强平兜底。
+             → 'monitor'
+      3. 两账户快照均**成功**且均为空 —— TWS 明确确认无持仓（是事实，
+         非取数失败）→ 跳过盯盘，只做防御性退出前回填后安全退出。
+             → 'safe_exit'
+
+    关键边界：**失败 ≠ 空**。只有"成功的空快照"才允许走 safe_exit。
+    """
+    if not pos_ok:
+        return 'defensive'
+    if (pos1 or pos2):
+        return 'monitor'
+    return 'safe_exit'
 
 
 async def main():
@@ -290,6 +354,29 @@ async def main():
         return
 
     # ============================================================
+    # 【2026-09-28】断线自动重连（代码审查发现：旧版断线后只写日志、无人重连，
+    # connectedEvent 的恢复逻辑永远不会触发；程序还在跑但下不了单/取不到数/强平失败）
+    # 现在：断线 → 同一 clientId 递进间隔重连；
+    #       重连成功后 → 同步持仓与在途订单（绝不自动撤在途单）→
+    #       行情重订阅（realtime connectedEvent 钩子，ib1 数据流属主）→
+    #       策略/盯盘自动恢复（bar 驱动，状态在内存未丢失）。
+    # 生命周期：此处之后无提前退出路径；清理段先 stop() 再 disconnect()（防僵尸重连）。
+    # ============================================================
+    async def _post_ib_reconnect(name: str, ib) -> None:
+        await sync_after_reconnect(ib, name)
+
+    reconn1 = IBReconnector(
+        ib1, TWS_HOST, ACCOUNT1_PORT, ACCOUNT1_CLIENT_ID,
+        "账户1(做空)", on_reconnected=lambda: _post_ib_reconnect("账户1(做空)", ib1))
+    reconn2 = IBReconnector(
+        ib2, TWS_HOST, ACCOUNT2_PORT, ACCOUNT2_CLIENT_ID,
+        "账户2(对冲)", on_reconnected=lambda: _post_ib_reconnect("账户2(对冲)", ib2))
+    reconn1.start()
+    reconn2.start()
+    logger.info("🔁 断线自动重连已启动（两账户；递进间隔 + 同一 clientId；"
+                "重连后自动同步持仓/在途订单并恢复数据流与策略）")
+
+    # ============================================================
     # 阶段7: 建仓收敛循环（R1）∥ 1分钟数据订阅（双通道保持）
     # 取代旧"通道1 买入补平(逐只3×5s核验) + 阶段7.5 三轮调平"：
     #   ≤5轮 / 总预算90s，每轮: 权威双快照 → 缺口/超额 → 并行发单 →
@@ -358,9 +445,32 @@ async def main():
     # 不依赖确认列表，而是检查TWS实际持仓
     # 使用权威快照（reqPositionsAsync 返回值），修复
     # "请求 + 固定sleep + 读长寿命缓存"的竞态（幽灵条目/半批读取会漏算对冲名单）
+    #
+    # 【2026-09-22 硬化】旧代码用宽松版 get_positions：请求一失败就返回 {}
+    # → "实际对冲=0" → 落入"TWS中无实际对冲持仓"分支断开退出，
+    # 当天全部对冲仓位无人盯盘、不强制平仓、留到隔夜。
+    # 现在：严格版 + 重试，且逐账户独立取——
+    #   成功（含成功空字典 = TWS 明确确认无持仓，是事实）→ 数据可信；
+    #   连续失败 → 记 pos_ok=False，"无法确认空"，绝不能当作"无持仓"。
     await asyncio.sleep(2)  # 等待TWS完成收敛循环末批订单的持仓更新
-    pos1_all = await get_positions(ib1, account1)
-    pos2_all = await get_positions(ib2, account2)
+    pos1_all, pos2_all = {}, {}
+    pos_ok = True
+    _snap_ok_accounts = set()  # 快照取数成功的账户（供量化核对跳过失败账户，防"账本 vs 0"误报）
+    for _tag, _ib, _acct in (('account1', ib1, account1), ('account2', ib2, account2)):
+        try:
+            _snap = await get_positions_strict_with_retry(_ib, _acct)
+        except PositionSnapshotError as e:
+            pos_ok = False
+            logger.critical(
+                f"🚨 {_tag} 持仓快照多次重试后仍失败: {e} —— "
+                f"该账户无法确认是否持仓（取数失败 ≠ 空持仓）"
+            )
+            continue
+        _snap_ok_accounts.add(_tag)
+        if _tag == 'account1':
+            pos1_all = _snap
+        else:
+            pos2_all = _snap
 
     # 找出两个账户都有持仓的股票（即实际成功对冲的）
     actual_hedged_symbols = set(pos1_all.keys()) & set(pos2_all.keys())
@@ -382,6 +492,7 @@ async def main():
     logger.info(
         f"📊 TWS实际持仓: 账户1={len(pos1_all)}只, 账户2={len(pos2_all)}只, "
         f"实际对冲={len(actual_hedged_symbols)}只"
+        + ("" if pos_ok else "  ⚠️（含快照失败账户：该侧数据不完整，按防御平仓处置）")
     )
 
     # ==================== 对账审计：账本开仓记录 vs 实际对冲名单（双向） ====================
@@ -422,6 +533,69 @@ async def main():
     except Exception as e:
         logger.warning(f"⚠️ 开仓对账检查失败: {e}")
 
+    # ==================== 对账审计(量化)：逐账户、逐只 账上未平股数 vs 实际持仓股数 ====================
+    # 【2026-09-28 审查修复】上面的"开仓对账"只做代码集合比对（两边都有该标的即过），
+    # 从不比数量 → "账本多记 / 少记"都能通过：ensure_cover 只补不减
+    # (gap = target − 已覆盖，取 max(0,·) )，多记的批次永远发现不了。
+    # 现逐账户、逐只比较"账上未平股数"(该账户所有未平批次 remaining 之和) 与
+    # "TWS实际持仓股数"(该账户该标的 |position|)，两者必须一致：
+    #   账本 > 实持仓 → 多记（ensure_cover 只补不减，需人工核实并扣减该账户批次）;
+    #   账本 < 实持仓 → 少记/漏记（延迟落账未补满等，需人工核实补记）。
+    # 注意：某账户快照取数失败（pos_ok=False）时该侧 TWS 数据不可信 → 跳过该账户量化核对。
+    if _snap_ok_accounts:
+        try:
+            def _ledger_open_shares(acct: str, code: str) -> int:
+                try:
+                    return sum(int(l['remaining']) for l in trade_store.get_open_lots(acct, code))
+                except Exception:
+                    return -1  # -1 表示该账户该标的账本读取失败（未知），下方单独处置
+
+            quantity_gaps = []
+            for _acct in ('account1', 'account2'):
+                if _acct not in _snap_ok_accounts:
+                    logger.warning(
+                        f"⚠️ 阶段8量化核对: {_acct} 快照取数失败，跳过该账户"
+                        f"（TWS数据不可信，不判定该股缺口）"
+                    )
+                    continue
+                pos_map = pos1_all if _acct == 'account1' else pos2_all
+                tws_shares = {code: abs(int(v['position']))
+                              for code, v in pos_map.items() if int(v['position']) != 0}
+                ledger_shares = {code: _ledger_open_shares(_acct, code)
+                                 for code in trade_store.open_codes(_acct)}
+                for code in sorted(set(tws_shares) | set(ledger_shares)):
+                    led = ledger_shares.get(code, 0)
+                    tws = tws_shares.get(code, 0)
+                    if led < 0:  # 该账户该标的账本读取失败 → 单独上报，不当缺口
+                        quantity_gaps.append((_acct, code, '?', tws, '账本读取失败，无法核对'))
+                        continue
+                    if led == tws:
+                        continue
+                    if led > tws:
+                        why = (f"账本多记 {led - tws}股（ensure_cover只补不减，"
+                               f"需人工核实并扣减该账户事件流批次）")
+                    else:
+                        why = (f"账本少记 {tws - led}股（实持仓多于账本，"
+                               f"可能漏记/延迟落账未补满，需人工核实补记）")
+                    quantity_gaps.append((_acct, code, led, tws, why))
+
+            if quantity_gaps:
+                _lines = '; '.join(
+                    f"{acct}:{code} 账本={led} 实持仓={tws} → {why}"
+                    for (acct, code, led, tws, why) in quantity_gaps
+                )
+                logger.critical(
+                    "🚨 阶段8账实核对(量化)发现数量缺口: " + _lines
+                    + " —— 代码集合一致但股数不符（多记/少记都会命中），"
+                      "请立即人工核对对应账户事件流批次与TWS实际持仓"
+                )
+            else:
+                logger.info(
+                    "✅ 阶段8账实核对(量化)通过: 逐账户、逐只 账上未平股数 == 实际持仓股数"
+                )
+        except Exception as e:
+            logger.warning(f"⚠️ 阶段8账实核对(量化)检查失败: {e}")
+
     # ==================== 延迟成交标的补齐（R10：并入收敛循环收尾，一处完成） ====================
     # 历史日志证据（2026-09-10/09-11、2026-09-21 INFQ/MSTR）：多数标的的卖空实际是在
     # "确认时点之后"才落账的。旧流程在这里显式补齐（补订阅/on_entry/差额补记）；
@@ -434,7 +608,28 @@ async def main():
             f"补订阅/入场登记/差额补记已由阶段7收敛收尾统一完成"
         )
 
-    if actual_hedged_stocks:
+    # ==================== 盯盘 + 强平门槛（2026-09-22 硬化） ====================
+    # 旧缺陷：actual_hedged_stocks 为空 → "跳过数据订阅和平仓管理" → 断开退出。
+    # TWS 一次抖动（快照取数失败被误读为空）即可让当天全部仓位无强平留到隔夜。
+    exit_mode = _decide_exit_mode(pos_ok, pos1_all, pos2_all)
+
+    if exit_mode == 'safe_exit':
+        logger.info(
+            "✅ TWS持仓确认: 两个账户均为空（两次权威快照均成功确认）—— 无需盯盘"
+        )
+        logger.info("\n📋 执行退出前防御性平仓回填...")
+        await close_manager.reconcile_csv_with_fills()
+    else:
+        if exit_mode == 'defensive':
+            logger.critical(
+                "🛡️ 防御性平仓模式: 持仓状态未确认（快照失败≠空持仓）—— "
+                "照常盯盘并等待收市前10分钟强制清仓（收盘后停止重试、CRITICAL 转人工，绝不带仓早退）"
+            )
+        elif not actual_hedged_stocks:
+            logger.critical(
+                f"🚨 检测到单边持仓（账户1={len(pos1_all)}只 / 账户2={len(pos2_all)}只，对冲不对称）—— "
+                f"照常盯盘 + 收市前强制平仓"
+            )
         # （策略激活已前移到阶段7.5之前；生效时点 = 第一根bar边界 开盘+60s，
         #  若调平拖过边界则 runner 已自动顺延为立即生效）
         logger.info(
@@ -443,43 +638,55 @@ async def main():
             f"  股票: {[s.code for s in actual_hedged_stocks]}\n"
             f"  1分钟实时数据流已在开盘第一分钟内接入；\n"
             f"  程序将持续运行，监控运行时平仓条件...\n"
-            f"  收市前5分钟将自动触发强制平仓。"
+            f"  收市前10分钟（约15:50）将自动触发强制平仓，收盘后停止重试转人工。"
         )
 
-        # 计算强制平仓时间（收市前5分钟；与"✅ 所有阶段完成"日志的"收市前5分钟"一致）
-        try:
-            close_hour, close_minute = map(int, close_time.split(':'))
-            now_est = get_current_time_est()
-            close_dt = now_est.replace(hour=close_hour, minute=close_minute, second=0, microsecond=0)
-            force_close_dt = close_dt - datetime.timedelta(minutes=5)
-            logger.info(f"⏰ 强制平仓触发时间设定为: {force_close_dt.strftime('%H:%M:%S')} 美东时间")
-        except Exception as e:
-            logger.error(f"❌ 解析收市时间失败: {e}")
-            force_close_dt = None
+        # 计算强制平仓时间（【2026-09-28 强平提速】收市前10分钟 = 15:50 开始）
+        # 更早进场，把多轮清仓全部落在可成交窗口内，避免拖到收盘后空转；
+        # 与下方"收盘即停"（force_close_until_flat 的 close_deadline）配套。
+        # 【2026-09-27 修复】解析失败不再留空（旧逻辑 → force_close_dt=None →
+        # 主循环永不到强平点、程序一直跑到深夜）：统一走 derive_close_deadlines
+        # 的默认 15:30 兜底，force_close_dt 永远存在。
+        close_dt, force_close_dt = derive_close_deadlines(close_time)
 
         # 持续运行循环
         try:
             while True:
                 now_est = get_current_time_est()
                 if force_close_dt and now_est >= force_close_dt:
-                    logger.info("⏰ 到达收市前5分钟，触发强制平仓...")
+                    logger.info("⏰ 到达收市前10分钟，触发强制平仓...")
                     # 【新增】先让运行时策略让路，防止并发对同一标的重复下单
                     runner.stop()
                     # 强制平仓窗口不再需要行情驱动，停止流看门狗巡检（is_quiet 也会静默）
                     recorder.stop_feed_watchdog()
 
-                    # 多轮强制平仓：单轮不收敛（超时）立即再开下一轮，
-                    # 直到清仓或达到总时限 —— 绝不带着残留仓位静默退出
-                    flat = False
-                    deadline = datetime.datetime.now() + datetime.timedelta(minutes=45)
-                    while not flat and datetime.datetime.now() < deadline:
-                        flat = await close_manager.force_close_until_flat(timeout_minutes=10)
-                        if not flat:
-                            logger.critical("⚠️ 本轮强制平仓后仍有残留，30秒后继续下一轮...")
-                            await asyncio.sleep(30)
+                    # 【2026-09-28 强平提速/收盘即停】
+                    # - 收盘前：force_close_until_flat 内部逐轮收敛（每轮清两账户全部未平，
+                    #   快照失败按"未知"续试）；强平模式每笔等待 60s、轮间 30s。
+                    # - 到达 close_deadline（收盘）立即停止，不再重试——普通市价单收盘后
+                    #   无法再成交，继续重试只会空转（此前外层固定 45 分钟重试窗，
+                    #   收盘后约 40 分钟全是空转，残留仓留到隔夜）。
+                    # - 收盘后仍有残留（停牌/流动性差）→ 只告警、转人工。
+                    close_deadline_local = None
+                    try:
+                        if close_dt is not None:
+                            # 把美东收盘时刻换算成与 datetime.now() 同基准（naive 本地）：
+                            # (close_dt - now_est) 是纯时长，加到本地 now 上即得收盘本地时刻，
+                            # 避免 aware / naive 混比抛 TypeError。
+                            close_deadline_local = (
+                                datetime.datetime.now() + (close_dt - get_current_time_est())
+                            )
+                    except Exception:
+                        close_deadline_local = None
+
+                    flat = await close_manager.force_close_until_flat(
+                        timeout_minutes=10, close_deadline=close_deadline_local)
+
                     if not flat:
                         logger.critical(
-                            "🚨 45分钟内多轮强制平仓仍未清仓 —— 请立即人工核查两个账户的TWS持仓并手动平仓！"
+                            "🚨 收盘后仍未清仓（可能停牌/流动性差）—— 收盘后已停止自动重试"
+                            "（普通市价单收盘后无法再成交）。请立即人工核对两个账户的TWS持仓"
+                            "并手动平仓，勿留隔夜仓位！"
                         )
                     break
                 await asyncio.sleep(10)
@@ -489,13 +696,18 @@ async def main():
         # 退出前 CSV 补写
         logger.info("\n📋 执行退出前 CSV 补写...")
         await close_manager.reconcile_csv_with_fills()
-    else:
-        logger.warning("⚠️ TWS中无实际对冲持仓，跳过数据订阅和平仓管理")
 
     # ============================================================
     # 清理
     # ============================================================
     logger.info("\n🔌 程序结束，断开连接...")
+    # 【2026-09-28】必须先停止重连器再断开 —— 否则 disconnect() 触发的断线状态
+    # 会让重连器在程序退出后"僵尸重连"（同一 clientId 二次拨号）
+    try:
+        reconn1.stop()
+        reconn2.stop()
+    except Exception:
+        pass
     try:
         ib1.disconnect()
         ib2.disconnect()
@@ -506,8 +718,11 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        # ib_async 需要修补 asyncio 以兼容
-        util.patchAsyncio()
+        # 【2026-09-28】去掉 util.patchAsyncio()（nest_asyncio，已停止维护）。
+        # 现在所有"请求/响应"型 IB 调用都走 *Async 版（qualifyContractsAsync /
+        # reqTickersAsync / reqHistoricalDataAsync / reqPositionsAsync 等），不再在
+        # 运行中的循环里靠 nest_asyncio 套 run_until_complete；下单/撤单(placeOrder/
+        # cancelOrder)是异步套件的直接发送（fire-and-forget），无需嵌套循环。
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n⚠️ 用户中断程序")
