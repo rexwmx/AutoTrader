@@ -130,7 +130,7 @@ async def verify_stock_qualification(ib: IB, symbol: str) -> dict:
     排除：
     - PINK/OTC 交易所
     - ETF/基金
-    - 杠杆/反向产品
+    - 杠杆产品
     - 新股（上市不足30天）
     - 无行业分类的股票
 
@@ -171,7 +171,7 @@ async def verify_stock_qualification(ib: IB, symbol: str) -> dict:
 
         # 3. 杠杆/反向产品检查
         if any(kw in long_name for kw in LEVERAGED_KEYWORDS):
-            logger.debug(f"  ❌ {symbol}: 杠杆/反向产品")
+            logger.debug(f"  ❌ {symbol}: 杠杆产品")
             return None
 
         # 4. 新股检查（历史数据天数）
@@ -185,11 +185,11 @@ async def verify_stock_qualification(ib: IB, symbol: str) -> dict:
                 whatToShow='TRADES',
                 useRTH=True
             )
-            if len(bars) < MIN_LISTING_DAYS:
-                logger.debug(
-                    f"  ❌ {symbol}: 新股 (历史{len(bars)}天 < {MIN_LISTING_DAYS}天)"
-                )
-                return None
+        #     if len(bars) < MIN_LISTING_DAYS:
+        #         logger.debug(
+        #             f"  ❌ {symbol}: 新股 (历史{len(bars)}天 < {MIN_LISTING_DAYS}天)"
+        #         )
+        #         return None
         except Exception:
             logger.debug(f"  ❌ {symbol}: 无法获取历史数据")
             return None
