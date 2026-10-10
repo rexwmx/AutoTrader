@@ -3,6 +3,7 @@
 交易日历模块
 负责判断美股交易日和获取市场时间
 """
+import asyncio
 import datetime
 import time as time_module
 import pytz
@@ -134,3 +135,40 @@ def wait_until_time(target_hour: int, target_minute: int, target_second: int = 0
             time_module.sleep(min(1, wait_seconds))
         else:
             return
+
+
+async def wait_until_est(target_dt: datetime.datetime, trades=(),
+                         poll_seconds: float = 0.5) -> None:
+    """
+    异步等待至指定美东时刻（await 版，不阻塞事件循环）
+
+    【2026-10-09 修复】10/9 事故根因之一：async main 里调用阻塞版 wait_until_time
+    （time.sleep）09:29:14→09:30:20 整整一分钟 event loop 被卡死，ib_async 收不到
+    任何回报——确认时看到的订单状态全是陈旧的（对已 Filled 的单也发撤单、
+    也无法在全部成交后提前进入确认）。本函数用 asyncio.sleep 让循环保持运转，
+    期间 TWS 回报（成交/撤单/状态变化）正常处理。
+
+    提前返回：trades 非空且**全部**订单已进入终态
+    （Filled / Cancelled / Inactive / ApiCancelled）时立即返回，不必硬等到 target_dt。
+    （代价：先成交的空头在剩余时间内处于未对冲状态，调用方已接受。）
+
+    ⚠️ 注意：本地被 ib_async 标记为 Cancelled 的单（非警告错误如 10349 的
+    "假 Cancelled"）在交易所侧可能仍挂单——撤单防线由调用方的 cancel 逻辑
+    （hedge.confirm_short_positions）兜底，不能在这里放行。
+
+    Args:
+        target_dt: 目标美东时刻（aware datetime，如 get_current_time_est() 同类型）
+        trades: 可选 Trade 列表；非空且全部 isDone() 则提前返回
+        poll_seconds: 轮询间隔（秒）
+    """
+    logger = get_logger()
+    while True:
+        if get_current_time_est() >= target_dt:
+            return
+        if trades and all(t.isDone() for t in trades):
+            logger.info(
+                f"⏩ 全部订单已进入终态，无需等到 "
+                f"{target_dt.strftime('%H:%M:%S')} 美东时间 —— 提前进入确认"
+            )
+            return
+        await asyncio.sleep(poll_seconds)

@@ -38,7 +38,13 @@ async def submit_sell_order(ib: IB, symbol: str, volume: int) -> Optional[Trade]
             return None
 
         contract = qualified[0]
-        order = MarketOrder('SELL', volume)
+        # 【2026-10-09 修复 P0】显式设置 TIF=DAY：
+        # MarketOrder 不设 tif → TWS 回 10349 警告（缺省 TIF 被套用）；ib_async 的
+        # wrapper 不把 10349 列入 warning 集合，而是按**硬错误**处理：本地把订单直接
+        # 标成 Cancelled（"假 Cancelled"）——但交易所侧订单可能仍然挂单，
+        # 程序按 Cancelled 放行后它迟到成交，就变成没有对冲的裸空头。
+        # 显式 tif='DAY' 从源头消除 10349。
+        order = MarketOrder('SELL', volume, tif='DAY')
         trade = ib.placeOrder(contract, order)
 
         # 仅做短暂等待让 API 注册订单，绝不提前判断生死
@@ -62,7 +68,9 @@ async def submit_buy_order(ib: IB, symbol: str, volume: int) -> Optional[Trade]:
             return None
 
         contract = qualified[0]
-        order = MarketOrder('BUY', volume)
+        # 【2026-10-09 修复 P0】同 SELL 单：显式 tif='DAY'，避免 10349 警告被 ib_async
+        # 按硬错误处理而本地"假 Cancelled"（交易所侧可能仍挂单 → 迟到成交）。
+        order = MarketOrder('BUY', volume, tif='DAY')
         trade = ib.placeOrder(contract, order)
 
         await asyncio.sleep(0.5)

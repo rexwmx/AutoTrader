@@ -31,6 +31,16 @@ FUND_PER_STOCK = 1000
 BATCH_SIZE = 15
 ORDER_TIMEOUT = 25
 
+# 【2026-10-09 修复】空头确认点截止：开盘/提交后最多等这么久让挂单成交
+# （全部订单提前进入终态则立即进入确认；10/9 测试：盘前排队单最长 ~1 分钟才成交，
+#  旧值 20s 太短导致 10/15 只被误撤）
+CONFIRM_WINDOW_SECONDS = 45
+
+# IBKR SHORTABLE 行情 tick id（reqMktData genericTickTypes）——查"能否借券做空"
+SHORTABLE_TICK_ID = '236'
+SHORTABLE_CHECK_TIMEOUT = 5.0      # 单只标的短卖资格查询超时（秒）
+BACKFILL_FILL_WAIT_SECONDS = 30.0  # 盘后补位：等待全部订单到终态的预算（秒）
+
 # ==================== CSV字段定义 ====================
 SELECTED_STOCKS_COLUMNS = [
     'date', 'code', 'exchange', 'industry', 'open', 'high', 'low',

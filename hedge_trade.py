@@ -18,12 +18,15 @@ from config import (
     SELL_RECORDS_FILE, BUY_RECORDS_FILE,
     ACCOUNT1_DIR, ACCOUNT2_DIR
 )
-from constants import SELECTION_COUNT, BATCH_SIZE
+from constants import (
+    SELECTION_COUNT, BATCH_SIZE,
+    TARGET_HEDGED_COUNT, CONFIRM_WINDOW_SECONDS,
+)
 
 from logger import setup_logging, get_logger
 from runtime import create_runtime_dir, create_subdirs
 from account import connect_both_accounts
-from trading_calendar import check_trading_day, wait_until_time, get_current_time_est
+from trading_calendar import check_trading_day, wait_until_est, get_current_time_est
 from database import (
     get_db_engine, cleanup_locked_stocks, get_locked_stocks,
     get_previous_trade_date, fetch_stock_data, check_data_availability
@@ -32,7 +35,7 @@ from selector import select_stocks
 from csv_writer import write_selected_stocks
 from trade_store import TradeStore
 from hedge import (
-    pre_submit_sell_orders, confirm_short_positions,
+    pre_submit_sell_orders, confirm_short_positions, backfill_short_positions,
 )
 from position import (
     reconcile_positions, get_positions_strict_with_retry, PositionSnapshotError,
@@ -301,19 +304,22 @@ async def main():
     # 阶段6: 执行对冲交易（优化时序：盘前预挂单 + 开盘确认 + 双通道并发）
     # ============================================================
     logger.info("\n" + "=" * 50)
-    logger.info("💱 阶段6: 执行对冲交易 (开盘-60s 预挂单 / 开盘+20s 确认 / 双通道并发)")
+    logger.info("💱 阶段6: 执行对冲交易 (开盘-60s 预挂单 / 开盘+45s 确认(可提前) / 不足10只自动补位 / 双通道并发)")
     logger.info("=" * 50)
 
-    # ---- 三个关键时点（不硬编码 09:29 / 09:30:20；open_dt 已在阶段3后推导）----
+    # ---- 关键时点（不硬编码 09:29 / 09:30:20；open_dt 已在阶段3后推导）----
     # 预报送 = 开盘-60s（盘前空闲窗口，TWS 置 PreSubmitted 排队）
-    # 确认定仓 = max(开盘+20s, 提交+20s)（程序晚启动时按提交时间顺延）
+    # 确认定仓 = max(开盘+45s, 提交+45s)（程序晚启动时按提交时间顺延；全部订单
+    #           到终态可提前；不足10只时由 6.4 补位兜底）
     # 策略激活 = 开盘+60s（第一根 1 分钟 bar 的收盘边界）
 
     # ---- 6.1 在 开盘-60s 预报送卖空订单（开盘钟声自动送入交易所撮合）----
     if open_dt:
         pre_submit_dt = open_dt - datetime.timedelta(seconds=60)
         logger.info(f"⏳ 等待至 {pre_submit_dt.strftime('%H:%M:%S')} (开盘-60s) 美东时间预挂单...")
-        wait_until_time(pre_submit_dt.hour, pre_submit_dt.minute, pre_submit_dt.second)
+        # 【2026-10-09 修复】旧版用的 wait_until_time(time.sleep 阻塞)会卡死
+        # 事件循环，ib_async 的回价/状态全收不到；改用异步等待（asyncio.sleep）。
+        await wait_until_est(pre_submit_dt)
     else:
         logger.info("⚠️ 无有效开盘时间，立即执行预报送（兜底路径）")
 
@@ -327,14 +333,24 @@ async def main():
         return
     submit_done_dt = get_current_time_est()  # 全部提交完成的时刻
 
-    # ---- 6.2 在 max(开盘+20s, 提交+20s) 确认空头持仓并冻结 ----
+    # ---- 6.2 在 max(开盘+45s, 提交+45s) 确认空头持仓并冻结 ----
+    # 【2026-10-09 修复】
+    # 1) 窗口 20s→45s（CONFIRM_WINDOW_SECONDS 可配）：盘前排队单（尤其无券可借/
+    #    延迟开盘/ Paper 撮合慢）在开盘后 ~1 分钟内才成交，20s 会把慢单误撤；
+    #    开盘后新下的市价单反而约 3 秒就成交——慢的就是盘前排队的单。
+    # 2) 等待改异步（wait_until_est）：阻塞 sleep 曾卡死事件循环一分钟，确认时
+    #    看到的是陈旧订单状态（对已 Filled 的单也发撤单）；
+    # 3) 全部订单提前进入终态则立即进入确认，不空等到 45s。
     if open_dt:
-        confirm_dt = max(open_dt + datetime.timedelta(seconds=20),
-                         submit_done_dt + datetime.timedelta(seconds=20))
+        confirm_dt = max(open_dt + datetime.timedelta(seconds=CONFIRM_WINDOW_SECONDS),
+                         submit_done_dt + datetime.timedelta(seconds=CONFIRM_WINDOW_SECONDS))
     else:
-        confirm_dt = submit_done_dt + datetime.timedelta(seconds=20)
-    logger.info(f"⏳ 等待至 {confirm_dt.strftime('%H:%M:%S')} 美东时间确认空头成交并撤残单...")
-    wait_until_time(confirm_dt.hour, confirm_dt.minute, confirm_dt.second)
+        confirm_dt = submit_done_dt + datetime.timedelta(seconds=CONFIRM_WINDOW_SECONDS)
+    logger.info(
+        f"⏳ 等待至 {confirm_dt.strftime('%H:%M:%S')} 美东时间确认空头成交并撤残单"
+        f"（开盘后确认窗口={CONFIRM_WINDOW_SECONDS}s，全部订单到终态则提前进入确认）..."
+    )
+    await wait_until_est(confirm_dt, trades=[t for (_s, t) in submitted_trades if t is not None])
 
     try:
         confirmed_stocks, pos1_snap = await confirm_short_positions(
@@ -348,10 +364,70 @@ async def main():
         return
 
     if not confirmed_stocks:
-        logger.critical("❌ 确认时点无任何卖空订单成交，程序终止")
+        logger.critical(
+            f"❌ 确认时点无任何卖空订单成交，程序终止。"
+            f"排查顺序：log 中 [短卖资格]/[撤单前诊断] 的 whyHeld（'locate' = 无券可借）→ "
+            f"延迟开盘 → Paper 撮合慢"
+        )
         ib1.disconnect()
         ib2.disconnect()
         return
+
+    # ---- 6.4 (2026-10-09 新增) 补位：确认不足 TARGET_HEDGED_COUNT 时，取下一批候选补齐 ----
+    # 10/9 根因：15 只盘前空单只有 5 只在确认点前成交，程序把剩下的 85 只候选整个
+    # 闲置（TARGET_HEDGED_COUNT=10 未被引用，"没有补位逻辑"）。
+    # 现在：补位池 = selected_stocks 剔除（首轮已提交 ∪ 已确认）；
+    # 补位流程 = 短卖资格预检 + 提交 → 等全部终态 → 撤残单(whyHeld 落日志)
+    #           → 双快照确认 → 写账本/登记策略（取前 extra_needed 只防补过头）。
+    # 新增确认合入 confirmed_stocks 后，阶段7收敛循环会自动按实际持仓在账户2补买对冲。
+    if len(confirmed_stocks) < TARGET_HEDGED_COUNT:
+        confirmed_codes_0 = {s.code for s in confirmed_stocks}
+        first_batch_codes = {s.code for s, _tr in submitted_trades}
+        remaining = [
+            s for s in selected_stocks
+            if s.code not in confirmed_codes_0 and s.code not in first_batch_codes
+        ]
+        extra_needed = TARGET_HEDGED_COUNT - len(confirmed_stocks)
+        if remaining:
+            # 取缺口 2 倍作补位池（给"不可借被剔除"留余量），至少 2 只
+            pool = remaining[:min(len(remaining), max(extra_needed * 2, 2))]
+            logger.info(
+                f"🔁 [补位] 已确认 {len(confirmed_stocks)}/{TARGET_HEDGED_COUNT} 不足，"
+                f"从下一批 {len(pool)} 只候选（剩余 {len(remaining)}）补位至多 {extra_needed} 只..."
+            )
+            try:
+                new_stocks, _snap = await backfill_short_positions(
+                    ib1, account1, pool, sell_csv_path,
+                    runner=runner, trade_store=trade_store,
+                    max_stocks=extra_needed,
+                )
+                known = {s.code for s in confirmed_stocks}
+                added = [s for s in new_stocks if s.code not in known]
+                confirmed_stocks.extend(added)
+                if len(confirmed_stocks) >= TARGET_HEDGED_COUNT:
+                    logger.info(
+                        f"✅ [补位] 补齐 {len(added)} 只 → 确认合计 {len(confirmed_stocks)}/"
+                        f"{TARGET_HEDGED_COUNT}（达标）"
+                    )
+                else:
+                    logger.warning(
+                        f"⚠️ [补位] 补位后仍仅 {len(confirmed_stocks)}/{TARGET_HEDGED_COUNT} —— "
+                        f"按现有数量继续。原因鉴别：查 log 中 'SHORTABLE 不可做空' / "
+                        f"'whyHeld'（'locate'=无券可借）/ 撤单前诊断条目"
+                    )
+            except PositionSnapshotError as e:
+                logger.critical(
+                    f"❌ 补位确认快照获取失败: {e} —— 取数失败≠无持仓，程序终止，"
+                    f"请人工核查两账户（首轮已确认 {len(confirmed_stocks)} 只不受影响）"
+                )
+                ib1.disconnect()
+                ib2.disconnect()
+                return
+        else:
+            logger.warning(
+                f"⚠️ [补位] 确认 {len(confirmed_stocks)}/{TARGET_HEDGED_COUNT} 不足且候选池已耗尽，"
+                f"按现有数量继续"
+            )
 
     # ============================================================
     # 【2026-09-28】断线自动重连（代码审查发现：旧版断线后只写日志、无人重连，
