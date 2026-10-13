@@ -155,24 +155,24 @@ async def verify_stock_qualification(ib: IB, symbol: str) -> dict:
         industry = d.industry or ''
         long_name = (d.longName or '').upper()
 
-        # 1. 交易所过滤
-        if primary_exch not in ALLOWED_EXCHANGES:
-            logger.debug(f"  ❌ {symbol}: 交易所不符 {primary_exch}")
-            return None
+        # # 1. 交易所过滤
+        # if primary_exch not in ALLOWED_EXCHANGES:
+        #     logger.debug(f"  ❌ {symbol}: 交易所不符 {primary_exch}")
+        #     return None
 
         # 2. 行业分类检查
         if not industry.strip():
             logger.debug(f"  ❌ {symbol}: 无行业分类")
             return None
 
-        if any(kw in industry for kw in ETF_INDUSTRIES):
-            logger.debug(f"  ❌ {symbol}: ETF/基金")
-            return None
-
-        # 3. 杠杆/反向产品检查
-        if any(kw in long_name for kw in LEVERAGED_KEYWORDS):
-            logger.debug(f"  ❌ {symbol}: 杠杆产品")
-            return None
+        # if any(kw in industry for kw in ETF_INDUSTRIES):
+        #     logger.debug(f"  ❌ {symbol}: ETF/基金")
+        #     return None
+        #
+        # # 3. 杠杆/反向产品检查
+        # if any(kw in long_name for kw in LEVERAGED_KEYWORDS):
+        #     logger.debug(f"  ❌ {symbol}: 杠杆产品")
+        #     return None
 
         # 4. 新股检查（历史数据天数）
         bars = None
