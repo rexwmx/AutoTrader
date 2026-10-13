@@ -20,26 +20,14 @@ def get_close_pct(peak_pct: float) -> float:
     if peak_pct < 1:
         return -1.0
     if peak_pct < 2:
-        return 0.65
+        return 1.0
     if peak_pct < 3:
         return 1.0
     if peak_pct < 4:
-        return 1.5
-    if peak_pct < 10:
+        return 2.0
+    if peak_pct < 6:
         return peak_pct * 0.50
-    if peak_pct < 15:
-        return peak_pct * 0.45
-    if peak_pct < 20:
-        return peak_pct * 0.40
-    if peak_pct < 25:
-        return peak_pct * 0.35
-    if peak_pct < 30:
-        return peak_pct * 0.30
-    if peak_pct < 60:
-        return peak_pct * 0.25
-    if peak_pct < 100:
-        return peak_pct * 0.20
-    return peak_pct * 0.10
+    return 3.0
 
 
 @dataclass
