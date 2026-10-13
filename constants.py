@@ -34,7 +34,7 @@ ORDER_TIMEOUT = 25
 # 【2026-10-09 修复】空头确认点截止：开盘/提交后最多等这么久让挂单成交
 # （全部订单提前进入终态则立即进入确认；10/9 测试：盘前排队单最长 ~1 分钟才成交，
 #  旧值 20s 太短导致 10/15 只被误撤）
-CONFIRM_WINDOW_SECONDS = 45
+CONFIRM_WINDOW_SECONDS = 30
 
 # IBKR SHORTABLE 行情 tick id（reqMktData genericTickTypes）——查"能否借券做空"
 SHORTABLE_TICK_ID = '236'
