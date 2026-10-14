@@ -541,6 +541,11 @@ class TradeStore:
         else:
             status = 'open'
 
+        # 【2026-10 新增】开仓均价 / 平仓均价（按股数加权，与同文件 open_fund/close_fund 自洽：
+        # open_fund ≈ open_vol × open_price）。无成交方向留空（避免 NaN）。
+        open_price = round(open_fund / open_vol, 4) if open_vol > 0 else ''
+        close_price = round(close_fund / close_vol, 4) if close_vol > 0 else ''
+
         action = 'sell' if account == 'account1' else 'buy'
         date_str = times[0][:10] if times else ''
 
@@ -554,7 +559,9 @@ class TradeStore:
             'lot_count': lot_count,
             'event_count': event_count,
             'open_vol': int(open_vol),
+            'open_price': open_price,
             'close_vol': int(close_vol),
+            'close_price': close_price,
             'remaining_vol': remaining_vol,
             'open_fund': round(open_fund, 2),
             'close_fund': round(close_fund, 2),

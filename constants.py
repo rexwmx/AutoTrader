@@ -77,10 +77,13 @@ ACCOUNT_EVENT_COLUMNS = [
 ]
 
 # ==================== 账户日汇总字段（sell.csv / buy.csv） ====================
+# open_price  开仓均价 = Σ(开仓股数×开仓价)/Σ开仓股数（= open_fund/open_vol，量加权）
+# close_price 平仓均价 = Σ(平仓股数×平仓价)/Σ平仓股数（= close_fund/close_vol，量加权）
+# 任一方向无成交（股数=0）时该字段留空，避免 NaN
 ACCOUNT_SUMMARY_COLUMNS = [
     'date', 'account', 'code', 'exchange', 'industry', 'action',
     'lot_count', 'event_count',
-    'open_vol', 'close_vol', 'remaining_vol',
+    'open_vol', 'open_price', 'close_vol', 'close_price', 'remaining_vol',
     'open_fund', 'close_fund',
     'gross_profit', 'commission', 'profit',
     'first_event_time', 'last_event_time', 'status'
