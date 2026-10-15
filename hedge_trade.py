@@ -280,10 +280,11 @@ async def main():
     # 策略 = 决策者（输入 bar + 持仓，输出信号，不碰 IB/CSV/全局变量）
     # Runner = 翻译官（拉持仓、调策略、执行信号、回传结果）
     # CloseManager = 执行者（下单、重试、CSV 回写、强制平仓）
-    # inner = 原有分段动态止盈策略；outer = 开盘前两分钟特殊策略
-    # （命中 7 种情况之一 → 由 outer 定案：立即平仓 / 不操作；未命中 → inner 照常接管）
-    open_window_inner = DynamicTPStrategy()
-    strategy = OpenWindowStrategy(open_window_inner, open_time=open_dt)
+    # 【停用】OpenWindowStrategy（开盘前两分钟特殊策略）：自本次修改起暂停启用，
+    # 开盘后至收市前强制平仓之间仅由 DynamicTPStrategy（分段动态止盈）单独接管。
+    # 待 OpenWindowStrategy 更新完成后再恢复包装：
+    #   strategy = OpenWindowStrategy(DynamicTPStrategy(), open_time=open_dt)
+    strategy = DynamicTPStrategy()
     # trade_store：事件流账本（account1/account2/{symbol}.csv + sell.csv/buy.csv 汇总）；
     # None 时 CloseManager 自动退化为旧 CSV 回写路径（兜底）
     close_manager = CloseManager(
@@ -298,7 +299,7 @@ async def main():
         close_manager=close_manager,
         open_time=open_dt,
     )
-    logger.info(f"🧠 策略: {strategy.__class__.__name__} ⊃ {open_window_inner.__class__.__name__}")
+    logger.info(f"🧠 策略: {strategy.__class__.__name__}（开盘窗口特殊策略 OpenWindowStrategy 已停用，仅动态止盈生效）")
 
     # ============================================================
     # 阶段6: 执行对冲交易（优化时序：盘前预挂单 + 开盘确认 + 双通道并发）
