@@ -3,20 +3,44 @@
 
 原 close.py 中的业务规则完整迁移至此，但只做决策，不做任何下单/写CSV动作。
 
-【特殊规则】新peak + 反向bar → 即时平仓判定（不等下一根bar）：
+【特殊规则A】新peak + 反向bar → 即时平仓判定（不等下一根bar）：
   做多：前一分钟bar的high就是peak；新一分钟bar的high创出新peak（新peak<4%），
         且新bar收阴（close<open）→ 用"新peak"按既有公式算平仓线，直接用本bar的
         close 判定，跌破平仓线立即平仓。
   做空：镜像（low 是 peak / 创新低且跌幅<4% / 新bar收阳 close>open）。
   动机：新peak出现且当根bar已反向时，peak 已经确定，无需再等下一根bar让
   close 基极值重新锚定后才判定。
+
+【特殊规则B】逐bar C/H 形态"冲高回落"→ 立即平仓（每根bar独立判定，与成本无关）：
+  全部相对本bar自身开盘价： C = (Close - Open) / Open * 100，H = (High - Open) / Open * 100
+  做多：
+    情况1: 0.4% < C <= 1% 且 1% <= H < 2%
+    情况2: 1% < C <= 2%   且 2% <= H < 3%
+    情况3: 1.5% < C <= 2% 且 3% <= H < 4%
+    情况4: C > 2% → 本规则停止生效（等价于以上各情况均不满足）
+    → 该bar冲高后收不回（"已经是1降"）→ 立即平多仓。
+  做空（完整镜像，High→Low，"上涨"→"下跌"）：
+    C' = (Open - Close) / Open * 100，L = (Open - Low) / Open * 100
+    情况1: 0.4% < C' <= 1% 且 1% <= L < 2%
+    情况2: 1% < C' <= 2%   且 2% <= L < 3%
+    情况3: 1.5% < C' <= 2% 且 3% <= L < 4%
+    情况4: C' > 2% → 本规则停止生效
+    → 该bar探底后收不回 → 立即买入回补空头。
+
+  两条特殊规则在同一腿同一bar最多只发一个信号（A优先，A未命中再看B）；
+  与既有去重集合（closed_acc1/2）及执行失败回滚机制完全共用。
 """
+
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
 from strategy.base import BaseStrategy, Bar, PositionView, CloseSignal
 from logger import get_logger
+
+# 特殊规则B边界容差：消除十进制边界（0.4/1/1.5/2/3/4%）的浮点表示误差，
+# 使"恰好落在边界上"的bar按规格语义（含边界一侧）确定性归类。
+EPS = 1e-9
 
 
 def get_close_pct(peak_pct: float) -> float:
@@ -91,7 +115,7 @@ class DynamicTPStrategy(BaseStrategy):
         if st.entry_time is None or bar.dt <= st.entry_time:
             return []
 
-        # ---- 【特殊规则预检】必须在把本 bar 纳入 high/low 极值之前，
+        # ---- 【特殊规则A预检】必须在把本 bar 纳入 high/low 极值之前，
         #      基于"前一分钟bar"的状态判定（新peak + 反向bar → 即时平仓）----
         long_sig = (self._check_long_special_rule(bar, pos, st)
                     if pos.acc2_pos > 0 and bar.symbol not in self.closed_acc2
@@ -99,6 +123,12 @@ class DynamicTPStrategy(BaseStrategy):
         short_sig = (self._check_short_special_rule(bar, pos, st)
                      if pos.acc1_pos < 0 and bar.symbol not in self.closed_acc1
                      else None)
+
+        # ---- 【特殊规则B】逐bar C/H 形态（规则A未命中才检查；命中即共用同一去重集合）----
+        if long_sig is None and pos.acc2_pos > 0 and bar.symbol not in self.closed_acc2:
+            long_sig = self._check_long_pct_rule(bar, pos)
+        if short_sig is None and pos.acc1_pos < 0 and bar.symbol not in self.closed_acc1:
+            short_sig = self._check_short_pct_rule(bar, pos)
 
         signals: list[CloseSignal] = []
         if long_sig is not None:
@@ -262,6 +292,108 @@ class DynamicTPStrategy(BaseStrategy):
             f"本bar创新低{bar.low:.2f}(-{peak_pct:.1f}%<4%)且收阳, "
             f"平仓线{close_line:.2f}(保留{close_pct:.1f}%), "
             f"本bar close {bar.close:.2f} → 即时平仓(不等下一根bar)"
+        )
+        return CloseSignal(
+            symbol=bar.symbol, account='account1',
+            side='buy', volume=abs(int(pos.acc1_pos)),
+            open_action='sell', reason=reason,
+            strategy='dynamic_tp',
+        )
+
+    # ------------------------------------------------------------------
+    # 【特殊规则B】逐bar C/H 形态"冲高回落/探底回升"→ 立即平仓
+    #   规则B只依赖本bar自身的 o/h/l/c（与建仓成本、前一根bar无关）；
+    #   触发前提是该腿有持仓（pos 检查在调用方完成）。
+    # ------------------------------------------------------------------
+    def _long_pct_case(self, bar: Bar) -> Optional[int]:
+        """做多bar形态分类。命中返回情况编号 1/2/3，未命中返回 None。
+
+        相对本bar自身开盘价： C = (Close-Open)/Open*100，H = (High-Open)/Open*100
+          情况1: 0.4 < C <= 1   且 1 <= H < 2
+          情况2: 1.0 < C <= 2   且 2 <= H < 3
+          情况3: 1.5 < C <= 2   且 3 <= H < 4
+          情况4: C > 2 → 规则停止（等价于以上均不命中）
+        """
+        if bar.open <= 0:
+            return None
+        c = (bar.close - bar.open) / bar.open * 100
+        h = (bar.high - bar.open) / bar.open * 100
+        if c <= 0.4 + EPS or c > 2.0 + EPS:     # C ≤ 0.4% 无情况适用；C > 2% 情况4停止
+            return None
+        if 1.0 - EPS <= h < 2.0 - EPS:          # H ∈ [1%, 2%)：要求 C ∈ (0.4%, 1%]
+            if c <= 1.0 + EPS:
+                return 1
+        elif 2.0 - EPS <= h < 3.0 - EPS:        # H ∈ [2%, 3%)：要求 C ∈ (1%, 2%]
+            if c > 1.0 + EPS:
+                return 2
+        elif h < 4.0 - EPS:                     # H ∈ [3%, 4%)：要求 C ∈ (1.5%, 2%]
+            if c > 1.5 + EPS:
+                return 3
+        return None
+
+    def _short_pct_case(self, bar: Bar) -> Optional[int]:
+        """做空bar形态分类（做多逻辑的完整镜像）。命中返回情况编号 1/2/3，未命中返回 None。
+
+        相对本bar自身开盘价： C' = (Open-Close)/Open*100（close低于open为正），
+                              L = (Open-Low)/Open*100（本bar下探幅度）
+          情况1: 0.4 < C' <= 1  且 1 <= L < 2
+          情况2: 1.0 < C' <= 2  且 2 <= L < 3
+          情况3: 1.5 < C' <= 2  且 3 <= L < 4
+          情况4: C' > 2 → 规则停止
+        """
+        if bar.open <= 0:
+            return None
+        c = (bar.open - bar.close) / bar.open * 100
+        l = (bar.open - bar.low) / bar.open * 100
+        if c <= 0.4 + EPS or c > 2.0 + EPS:
+            return None
+        if 1.0 - EPS <= l < 2.0 - EPS:
+            if c <= 1.0 + EPS:
+                return 1
+        elif 2.0 - EPS <= l < 3.0 - EPS:
+            if c > 1.0 + EPS:
+                return 2
+        elif l < 4.0 - EPS:
+            if c > 1.5 + EPS:
+                return 3
+        return None
+
+    def _check_long_pct_rule(self, bar: Bar, pos: PositionView) -> Optional[CloseSignal]:
+        """做多腿【特殊规则B】：单bar"冲高回落"（H达1%~4%、但close低于冲高一个档）→ 立即平多仓。
+
+        触发条件完全由本bar自身的 C/H 形态决定（按需求原文，不附加成本/盈亏条件）；
+        命中任一情况即平仓（情况4 C>2% 时规则停止，不会进入本方法）。
+        """
+        case = self._long_pct_case(bar)
+        if case is None:
+            return None
+        self.closed_acc2.add(bar.symbol)
+        c_pct = (bar.close - bar.open) / bar.open * 100
+        h_pct = (bar.high - bar.open) / bar.open * 100
+        reason = (
+            f"账户2(做多)逐bar形态规则 | 本bar o={bar.open:.4f} h={bar.high:.4f} c={bar.close:.4f} | "
+            f"C={c_pct:+.2f}% H={h_pct:+.2f}% 情况{case}（冲高回落，已是1降）"
+            f"→ 立即平多仓(sell {int(pos.acc2_pos)}股)"
+        )
+        return CloseSignal(
+            symbol=bar.symbol, account='account2',
+            side='sell', volume=int(pos.acc2_pos),
+            open_action='buy', reason=reason,
+            strategy='dynamic_tp',
+        )
+
+    def _check_short_pct_rule(self, bar: Bar, pos: PositionView) -> Optional[CloseSignal]:
+        """做空腿【特殊规则B】（做多镜像）：单bar"探底回升"（L达1%~4%、但close仍在低档位）→ 立即买入回补。"""
+        case = self._short_pct_case(bar)
+        if case is None:
+            return None
+        self.closed_acc1.add(bar.symbol)
+        c_pct = (bar.open - bar.close) / bar.open * 100
+        l_pct = (bar.open - bar.low) / bar.open * 100
+        reason = (
+            f"账户1(做空)逐bar形态规则 | 本bar o={bar.open:.4f} l={bar.low:.4f} c={bar.close:.4f} | "
+            f"C'={c_pct:+.2f}% L={l_pct:+.2f}% 情况{case}（探底回升，已是1升）"
+            f"→ 立即买入回补(buy {abs(int(pos.acc1_pos))}股)"
         )
         return CloseSignal(
             symbol=bar.symbol, account='account1',

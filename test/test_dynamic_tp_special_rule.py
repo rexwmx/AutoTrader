@@ -32,7 +32,25 @@ DynamicTPStrategy 特殊规则（新peak + 反向bar → 即时平仓，不等�
   M2  同bar普通规则与特殊规则同腿同时命中 → 只发 1 个信号（不重复下单）
   M3  原普通规则回归（close 基触发行为不变）
   M4  展示字段回归（仍基于 close 基极值）
-  M5  Runner 端到端（特殊规则信号正确分发为 1 笔平仓单）
+  M5  Runner 端到端（特殊规则A信号正确分发为 1 笔平仓单）
+
+规则B 逐bar C/H 形态用例（做多相对本bar开盘价 C=(Close-Open)/Open, H=(High-Open)/Open）：
+  L21 情况1触发 (0.4<C<=1 且 1<=H<2)            L22 情况2触发 (1<C<=2 且 2<=H<3)
+  L23 情况3触发 (1.5<C<=2 且 3<=H<4)             L24 情况4 (C>2 规则停止)
+  L25 H<1 不出档                               L26 H>=4 超出上限
+  L27 C=0.4 边界(不含)不触发                     L28 C=1.0 边界(含)触发情况1
+  L29 H=2.0 边界落入情况2档                       L30 H=3.0 边界落入情况3档
+  L31 H∈[1,2) 但 C>1 不触发                      L32 H∈[2,3) 但 C<=1 不触发
+  L33 H∈[3,4) 但 C<=1.5 不触发                   L34 去重（同形态2根bar只1单）
+  L35 回滚（执行失败后下一bar可再触发）
+  K12~K20 做空镜像（Low 代替 High，C'=(Open-Close)/Open） + K21 去重
+  M6  双腿：做多形态bar → 仅做多腿1单             M7  双腿：做空形态bar → 仅做空腿1单
+  M8  同bar：规则A做多触发 + 规则B做空触发 → 双腿各1单（2单）
+  M9  规则B与普通规则同腿双命中 → 只发1单
+  M10 规则B与成本/盈亏无关（浮亏bar仍按形态触发）
+  注：K5 因新增规则B而结果变化 —— 该bar规则A不触发（未收阳），但命中规则B情况1 → 触发1单
+
+共存语义：同一腿同一bar A优先 → B → 普通规则，最多1个信号；去重/回滚共用。
 
 运行：python test/test_dynamic_tp_special_rule.py   （任意 cwd 均可）
 """
@@ -84,6 +102,10 @@ def mk(entry_long=True, entry_short=True):
 
 def is_special(sig):
     return '特殊规则' in sig.reason
+
+def is_rule_b(sig):
+    """规则B（逐bar C/H 形态）信号：reason 含「逐bar形态规则」（规则A为「特殊规则」，不互相包含）"""
+    return '逐bar形态规则' in sig.reason
 
 
 class FakeCloseManager:
@@ -288,13 +310,16 @@ def main():
     ])
     check('K4 做空不触发: 前一分钟bar的low不是极值', len(sigs) == 0, detail=str(sigs))
 
-    # K5 不触发（新bar 收阴 close 97.0 < open 97.8，镜像要求收阳）
+    # K5 规则A不触发（新bar 收阴 close 97.0 < open 97.8，镜像要求收阳）；
+    #    但该单bar形态（C'=0.82%∈(0.4,1], L=1.33%∈[1,2)）命中【规则B】情况1 → 规则B触发1单
     s = mk(entry_long=False)
     sigs = feed(s, POS_SHORT, [
         bar(1, 96.9, 98.0, 97.0, 97.4),
         bar(2, 97.8, 97.9, 96.5, 97.0),
     ])
-    check('K5 做空不触发: 新bar未收阳', len(sigs) == 0, detail=str(sigs))
+    check('K5 规则A不触发(未收阳); 规则B情况1(探底回升)命中 → 1单',
+          len(sigs) == 1 and is_rule_b(sigs[0]) and sigs[0].side == 'buy',
+          detail=str([(x.side, x.reason[:40]) for x in sigs]))
 
     # K6 不触发（bar 间缺 1 分钟）
     s = mk(entry_long=False)
@@ -377,6 +402,219 @@ def main():
           and fcm.calls[0]['action'] == 'sell' and fcm.calls[0]['volume'] == 10
           and fcm.calls[0]['open_action'] == 'buy' and fcm.calls[0]['open_price'] == 100.0,
           detail=str(fcm.calls))
+
+    # ==================== L21+ 系列：【规则B】做多逐bar形态（账户2） ====================
+    # 规则B只依赖本bar自身 o/h/l/c（与成本、前一根bar均无关）
+
+    # L21 情况1：C=0.8%∈(0.4,1]，H=1.5%∈[1,2) → 触发
+    s = mk(entry_short=False)
+    sigs = feed(s, POS_LONG, [bar(1, 100.0, 101.5, 99.9, 100.8)])
+    check('L21 规则B情况1触发 (0.4<C<=1, 1<=H<2)',
+          len(sigs) == 1 and is_rule_b(sigs[0]) and sigs[0].side == 'sell'
+          and sigs[0].account == 'account2' and sigs[0].open_action == 'buy',
+          detail=str([(x.side, x.reason[:60]) for x in sigs]))
+
+    # L22 情况2：C=1.8%∈(1,2]，H=2.5%∈[2,3) → 触发
+    s = mk(entry_short=False)
+    sigs = feed(s, POS_LONG, [bar(1, 100.0, 102.5, 101.0, 101.8)])
+    check('L22 规则B情况2触发 (1<C<=2, 2<=H<3)', len(sigs) == 1 and is_rule_b(sigs[0]),
+          detail=str([(x.side, x.reason[:60]) for x in sigs]))
+
+    # L23 情况3：C=1.9%∈(1.5,2]，H=3.5%∈[3,4) → 触发
+    s = mk(entry_short=False)
+    sigs = feed(s, POS_LONG, [bar(1, 100.0, 103.5, 101.0, 101.9)])
+    check('L23 规则B情况3触发 (1.5<C<=2, 3<=H<4)', len(sigs) == 1 and is_rule_b(sigs[0]),
+          detail=str([(x.side, x.reason[:60]) for x in sigs]))
+
+    # L24 情况4：C=2.5% > 2% → 规则停止（H=3.2% 虽在档内也不触发）
+    s = mk(entry_short=False)
+    sigs = feed(s, POS_LONG, [bar(1, 100.0, 103.2, 99.9, 102.5)])
+    check('L24 规则B情况4: C>2% 停止生效', len(sigs) == 0, detail=str(sigs))
+
+    # L25 H=0.8% < 1% → 无档位
+    s = mk(entry_short=False)
+    sigs = feed(s, POS_LONG, [bar(1, 100.0, 100.8, 99.9, 100.6)])
+    check('L25 H<1% 无档位不触发', len(sigs) == 0, detail=str(sigs))
+
+    # L26 H=4.5% >= 4% → 超上限（C=1.8% 在档外）
+    s = mk(entry_short=False)
+    sigs = feed(s, POS_LONG, [bar(1, 100.0, 104.5, 99.9, 101.8)])
+    check('L26 H>=4% 不触发', len(sigs) == 0, detail=str(sigs))
+
+    # L27 边界：C=0.4%（严格 >0.4 不成立）→ 不触发
+    s = mk(entry_short=False)
+    sigs = feed(s, POS_LONG, [bar(1, 100.0, 101.5, 99.9, 100.4)])
+    check('L27 边界: C=0.4% 不触发', len(sigs) == 0, detail=str(sigs))
+
+    # L28 边界：C=1.0%（<=1 含）且 H=1.5% → 情况1触发
+    s = mk(entry_short=False)
+    sigs = feed(s, POS_LONG, [bar(1, 100.0, 101.5, 99.9, 101.0)])
+    check('L28 边界: C=1.0%,H=1.5% 触发情况1', len(sigs) == 1 and is_rule_b(sigs[0]),
+          detail=str([(x.side, x.reason[:60]) for x in sigs]))
+
+    # L29 边界：H=2.0%（>=2 落情况2档），C=1.6%∈(1,2] → 触发
+    s = mk(entry_short=False)
+    sigs = feed(s, POS_LONG, [bar(1, 100.0, 102.0, 100.5, 101.6)])
+    check('L29 边界: H=2.0% 落情况2档触发', len(sigs) == 1 and is_rule_b(sigs[0]),
+          detail=str([(x.side, x.reason[:60]) for x in sigs]))
+
+    # L30 边界：H=3.0%（>=3 落情况3档），C=1.9%∈(1.5,2] → 触发
+    s = mk(entry_short=False)
+    sigs = feed(s, POS_LONG, [bar(1, 100.0, 103.0, 100.5, 101.9)])
+    check('L30 边界: H=3.0% 落情况3档触发', len(sigs) == 1 and is_rule_b(sigs[0]),
+          detail=str([(x.side, x.reason[:60]) for x in sigs]))
+
+    # L31 H∈[1,2) 但 C=1.2% > 1% → 档内C超界不触发
+    s = mk(entry_short=False)
+    sigs = feed(s, POS_LONG, [bar(1, 100.0, 101.5, 99.9, 101.2)])
+    check('L31 H∈[1,2) 但 C>1 不触发', len(sigs) == 0, detail=str(sigs))
+
+    # L32 H∈[2,3) 但 C=0.9% <= 1% → 档内C未达下界不触发
+    s = mk(entry_short=False)
+    sigs = feed(s, POS_LONG, [bar(1, 100.0, 102.5, 99.9, 100.9)])
+    check('L32 H∈[2,3) 但 C<=1 不触发', len(sigs) == 0, detail=str(sigs))
+
+    # L33 H∈[3,4) 但 C=1.5%（严格 >1.5 不成立）→ 不触发
+    s = mk(entry_short=False)
+    sigs = feed(s, POS_LONG, [bar(1, 100.0, 103.5, 99.9, 101.5)])
+    check('L33 H∈[3,4) 但 C=1.5% 不触发', len(sigs) == 0, detail=str(sigs))
+
+    # L34 去重：同形态两根bar → 只发1单
+    s = mk(entry_short=False)
+    sigs = feed(s, POS_LONG, [
+        bar(1, 100.0, 101.5, 99.9, 100.8),
+        bar(2, 100.0, 101.5, 99.9, 100.8),
+    ])
+    check('L34 规则B去重: 同形态2根bar只发1单', len(sigs) == 1 and is_rule_b(sigs[0]),
+          detail=f'count={len(sigs)}')
+
+    # L35 回滚：执行失败 → 下一根同形态bar可再触发
+    s = mk(entry_short=False)
+    sigs = feed(s, POS_LONG, [bar(1, 100.0, 101.5, 99.9, 100.8)])
+    assert len(sigs) == 1
+    s.on_execution_result(sigs[0], success=False)      # 执行失败 → 回滚去重标记
+    sigs2 = feed(s, POS_LONG, [bar(2, 100.0, 101.5, 99.9, 100.8)])
+    check('L35 规则B回滚: 执行失败后下一根bar可再触发',
+          len(sigs2) == 1 and is_rule_b(sigs2[0]), detail=f'count={len(sigs2)}')
+
+    # ==================== K12+ 系列：【规则B】做空逐bar形态（账户1，镜像） ====================
+
+    # K12 情况1：C'=0.8%∈(0.4,1]，L=1.5%∈[1,2) → 触发（买入回补）
+    s = mk(entry_long=False)
+    sigs = feed(s, POS_SHORT, [bar(1, 100.0, 100.3, 98.5, 99.2)])
+    check('K12 规则B情况1触发(镜像) (0.4<C\'<=1, 1<=L<2)',
+          len(sigs) == 1 and is_rule_b(sigs[0]) and sigs[0].side == 'buy'
+          and sigs[0].account == 'account1' and sigs[0].open_action == 'sell',
+          detail=str([(x.side, x.reason[:60]) for x in sigs]))
+
+    # K13 情况2：C'=1.8%∈(1,2]，L=2.5%∈[2,3) → 触发
+    s = mk(entry_long=False)
+    sigs = feed(s, POS_SHORT, [bar(1, 100.0, 100.2, 97.5, 98.2)])
+    check('K13 规则B情况2触发(镜像) (1<C\'<=2, 2<=L<3)',
+          len(sigs) == 1 and is_rule_b(sigs[0]), detail=str([(x.side, x.reason[:60]) for x in sigs]))
+
+    # K14 情况3：C'=1.9%∈(1.5,2]，L=3.5%∈[3,4) → 触发
+    s = mk(entry_long=False)
+    sigs = feed(s, POS_SHORT, [bar(1, 100.0, 100.2, 96.5, 98.1)])
+    check('K14 规则B情况3触发(镜像) (1.5<C\'<=2, 3<=L<4)',
+          len(sigs) == 1 and is_rule_b(sigs[0]), detail=str([(x.side, x.reason[:60]) for x in sigs]))
+
+    # K15 情况4：C'=2.5% > 2% → 规则停止
+    s = mk(entry_long=False)
+    sigs = feed(s, POS_SHORT, [bar(1, 100.0, 100.5, 96.8, 97.5)])
+    check('K15 规则B情况4(镜像): C\'>2% 停止生效', len(sigs) == 0, detail=str(sigs))
+
+    # K16 L=0.8% < 1% → 无档位（C'=0.6%）
+    s = mk(entry_long=False)
+    sigs = feed(s, POS_SHORT, [bar(1, 100.0, 100.5, 99.2, 99.4)])
+    check('K16 L<1% 无档位不触发', len(sigs) == 0, detail=str(sigs))
+
+    # K17 L=4.5% >= 4% → 超上限（C'=1.8%）
+    s = mk(entry_long=False)
+    sigs = feed(s, POS_SHORT, [bar(1, 100.0, 100.5, 95.5, 98.2)])
+    check('K17 L>=4% 不触发', len(sigs) == 0, detail=str(sigs))
+
+    # K18 边界：C'=1.0%（<=1 含），L=1.0%（>=1 含）→ 情况1触发
+    s = mk(entry_long=False)
+    sigs = feed(s, POS_SHORT, [bar(1, 100.0, 100.5, 99.0, 99.0)])
+    check('K18 边界: C\'=1.0%,L=1.0% 触发情况1', len(sigs) == 1 and is_rule_b(sigs[0]),
+          detail=str([(x.side, x.reason[:60]) for x in sigs]))
+
+    # K19 边界：L=2.0%（>=2 落情况2档），C'=1.02%∈(1,2] → 触发
+    s = mk(entry_long=False)
+    sigs = feed(s, POS_SHORT, [bar(1, 100.0, 100.5, 98.0, 98.98)])
+    check('K19 边界: L=2.0% 落情况2档触发', len(sigs) == 1 and is_rule_b(sigs[0]),
+          detail=str([(x.side, x.reason[:60]) for x in sigs]))
+
+    # K20 L∈[1,2) 但 C'=1.2% > 1% → 档内C超界不触发
+    s = mk(entry_long=False)
+    sigs = feed(s, POS_SHORT, [bar(1, 100.0, 100.5, 98.6, 98.8)])
+    check('K20 L∈[1,2) 但 C\'>1 不触发', len(sigs) == 0, detail=str(sigs))
+
+    # K21 去重：同形态两根bar → 只发1单
+    s = mk(entry_long=False)
+    sigs = feed(s, POS_SHORT, [
+        bar(1, 100.0, 100.3, 98.5, 99.2),
+        bar(2, 100.0, 100.3, 98.5, 99.2),
+    ])
+    check('K21 规则B去重: 同形态2根bar只发1单', len(sigs) == 1 and is_rule_b(sigs[0]),
+          detail=f'count={len(sigs)}')
+
+    # ==================== M6+ 系列：规则A/B 与既有规则共存 ====================
+
+    # M6 双腿独立：做多形态bar（C=0.8%,H=1.5%）→ 仅做多腿规则B触发1单
+    s = mk()
+    sigs = feed(s, POS_BOTH, [bar(1, 100.0, 101.5, 100.2, 100.8)])
+    check('M6 双腿: 做多形态bar → 仅做多腿1单',
+          len(sigs) == 1 and sigs[0].account == 'account2' and sigs[0].side == 'sell'
+          and is_rule_b(sigs[0]),
+          detail=str([(x.account, x.side) for x in sigs]))
+
+    # M7 双腿独立：做空形态bar（C'=0.8%,L=1.5%）→ 仅做空腿规则B触发1单
+    s = mk()
+    sigs = feed(s, POS_BOTH, [bar(1, 100.0, 100.3, 98.5, 99.2)])
+    check('M7 双腿: 做空形态bar → 仅做空腿1单',
+          len(sigs) == 1 and sigs[0].account == 'account1' and sigs[0].side == 'buy'
+          and is_rule_b(sigs[0]),
+          detail=str([(x.account, x.side) for x in sigs]))
+
+    def is_rule_a(sig):
+        """规则A（新peak+反向bar）信号：reason 含「特殊规则」且不含「逐bar形态规则」"""
+        return ('特殊规则' in sig.reason) and not is_rule_b(sig)
+
+    # M8 同bar双腿独立：规则A做多腿触发 + 规则B做空腿触发 → 各1单（共2单）
+    #    bar2: 多head新高102.1(规则A) 且 C'=0.495%,L=1.78%（规则B情况1）
+    s8 = DynamicTPStrategy()
+    s8.on_entry('X', 'account2', 100.0, 10, ENTRY)      # 做多成本 100
+    s8.on_entry('X', 'account1', 120.0, 10, ENTRY)      # 做空成本 120
+    pos8 = PositionView('X', -10, 120.0, 10, 100.0)
+    sigs8 = feed(s8, pos8, [
+        bar(1, 100.0, 101.5, 99.9, 101.2),              # 建立 prev（high 101.5 为 peak）
+        bar(2, 101.0, 102.1, 99.2, 100.5),              # 规则A做多 + 规则B做空 同时命中
+    ])
+    check('M8 同bar: 规则A(做多)+规则B(做空)双腿各1单',
+          len(sigs8) == 2
+          and any(x.account == 'account2' and x.side == 'sell' and is_rule_a(x) for x in sigs8)
+          and any(x.account == 'account1' and x.side == 'buy' and is_rule_b(x) for x in sigs8),
+          detail=str([(x.account, x.side, x.reason[:36]) for x in sigs8]))
+
+    # M9 规则B与普通规则同腿均会命中 → 只发1单（B优先，不重复下单）
+    s = mk(entry_short=False)
+    sigs = feed(s, POS_LONG, [
+        bar(1, 100.0, 103.0, 100.0, 103.0),       # close peak 103(+3%) → 普通规则线102
+        bar(2, 100.0, 103.5, 100.5, 101.9),       # B情况3(C=1.9%,H=3.5%) 且 普通规则 101.9<=102 均命中
+    ])
+    check('M9 规则B与普通规则双命中只发1单', len(sigs) == 1 and is_rule_b(sigs[0]),
+          detail=f'count={len(sigs)}')
+
+    # M10 规则B与成本/盈亏无关：浮亏仓位（成本110、现价≈100）遇做多形态bar仍按形态触发
+    s10 = DynamicTPStrategy()
+    s10.on_entry('X', 'account2', 110.0, 10, ENTRY)    # 做多成本 110（当前价 ≈ 浮亏）
+    pos10 = PositionView('X', 0, 0.0, 10, 110.0)
+    sigs10 = feed(s10, pos10, [bar(1, 100.0, 101.5, 99.9, 100.8)])
+    check('M10 规则B与成本无关: 浮亏bar按形态仍触发',
+          len(sigs10) == 1 and is_rule_b(sigs10[0]) and sigs10[0].side == 'sell',
+          detail=str([(x.side, x.reason[:60]) for x in sigs10]))
 
     # ---- 汇总 ----
     if failures:
