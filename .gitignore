@@ -1,7 +1,6 @@
 /__pycache__
 /test/__pycache__
 /strategy/__pycache__
-/change_plan
 /trade_log
 /backtest/data
 /backtest/result
