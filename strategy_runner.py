@@ -11,6 +11,26 @@
 - 策略完全不感知 IB / CSV / 全局状态
 - 建仓时间在此处登记，用于跳过建仓前的历史 bar（避免无谓的拉持仓）
 - active / activate_at 与收市前强制平仓窗口联动：强制平仓开始时 stop()
+
+并发模型（2026-10-19 修订，废除"全局锁包住评估+下单等待"的旧设计）：
+- 旧设计：on_bar 用一把全局 asyncio.Lock 串行所有标的，且锁内包含平仓执行
+  （等成交 120s + 重试 10s + 再等 120s）——一只标的平仓期间，其余全部标的的
+  bar 都排队等待最坏约 4 分钟；且 asyncio.Lock 的等待队列是 LIFO，争抢时
+  后到的同标的 bar 可能先被评估，破坏策略的时序状态机（前bar判定/极值/去重）。
+- 新设计：
+  1) 稳态路径【同标的严格 FIFO、跨标的并发】：每标的一条 Event 门链
+     （_with_symbol_gate），同一标的的"拉快照→策略决策→执行平仓→结果回传"
+     严格保序且互斥（保证同标的不会并发下单/账本交叉），不同标的完全并发
+     （各自 IB 请求/订单独立，trade_store 的账户×标的级 threading.Lock
+     与同步 append_close/汇总重建已保证账本安全）；
+  2) 并发度有界：仅"拉快照+策略决策"的快速阶段受 _eval_sem 限流
+     （避免分钟边界数百只标的的持仓快照同时轰 TWS）；慢速的下单等待阶段
+     不占并发名额，不拖累其他标的；
+  3) 过渡路径保持旧的全局独占语义（一次性）：激活前 bar 入队、激活后首次
+     补评估（early-bars 队列）仍在 _bar_lock 内按到达顺序串行完成，
+     之后稳态路径不再触碰全局锁。
+- 死锁规避：信号量只在"同标的队列已排到自己"之后获取（门内、执行前），
+  等待前驱的任务绝不持有信号量 → 无环路等待。
 """
 import asyncio
 import datetime
@@ -25,13 +45,19 @@ from logger import get_logger
 
 _EST = pytz.timezone('US/Eastern')
 
+# 快速阶段（拉持仓快照+策略决策）的最大并发数：
+# 分钟边界会瞬间到达几十~上百只标的的 bar，不加限流会同时打出 2×N 个 TWS
+# 持仓请求；慢速的平仓下单等待不受此限，不占名额。
+DEFAULT_MAX_CONCURRENT_EVALS = 8
+
 
 class StrategyRunner:
     def __init__(self, strategy: BaseStrategy,
                  ib1: IB, ib2: IB, account1: str, account2: str,
                  sell_csv_path, buy_csv_path,
                  close_manager,
-                 open_time: Optional[datetime.datetime] = None):
+                 open_time: Optional[datetime.datetime] = None,
+                 max_concurrent_evals: int = DEFAULT_MAX_CONCURRENT_EVALS):
         self.strategy = strategy
         self.ib1 = ib1
         self.ib2 = ib2
@@ -65,6 +91,20 @@ class StrategyRunner:
         self._early_bars: list = []
         self._bar_lock = asyncio.Lock()
         self._early_flush_scheduled = False
+        # 激活后的一次性补评估（early-bars 队列）是否已完成；
+        # 仅用于过渡阶段的全局独占判定，稳态路径不再依赖它。
+        # 默认 False（未激活过）：无论 activate_at 经 start() 设置还是外部直接赋值，
+        # 激活后的首次评估/定时冲刷都保证先补队列（activate_at 为 None 时补空队列，无副作用）
+        self._activation_done: bool = False
+
+        # ==================== 稳态并发结构（2026-10-19） ====================
+        # 每标的严格 FIFO 门链：symbol -> 当前队尾任务的 asyncio.Event。
+        # 不用 asyncio.Lock：其等待队列是 LIFO（release 时 pop 最新等待者），
+        # 多任务争抢时后到的同标的 bar 可能先执行，破坏策略时序；
+        # Event 链保证 T2 必然在 T1（先入队者）完成之后才启动。
+        self._symbol_gate: dict = {}
+        # 快速阶段（拉快照+策略决策）并发上限；下单等待阶段不占名额
+        self._eval_sem = asyncio.Semaphore(max(1, int(max_concurrent_evals)))
 
     # ------------------------------------------------------------------
     # 时区归一化
@@ -119,6 +159,7 @@ class StrategyRunner:
         # 防止跨周期把过期行情补评估进新状态
         self._early_bars.clear()
         self._early_flush_scheduled = False
+        self._activation_done = False   # 新一轮激活：过渡补评估尚未执行
         self.active = True
         self.activate_at = activate_at
         self.logger.info(
@@ -167,6 +208,9 @@ class StrategyRunner:
         - 失败/异常 → on_execution_result(sig, False)（策略回滚去重标记，下一根 bar 可重试）。
         绝不做"评估了但不执行"：信号在生成时已按既有语义设置去重标记，
         这里要么执行、要么回滚，二者必居其一。
+
+        并发契约（2026-10-19）：每个标的的重放执行经同标的门链串行，
+        与该标的正在执行平仓的新 bar 严格保序，绝不并发双下单。
         """
         if not self._paused_pending:
             return 0
@@ -181,7 +225,8 @@ class StrategyRunner:
                 order.append(pos)
             groups[pos].append(sig)
         for pos in order:
-            await self._execute_signals(groups[pos], pos)
+            await self._with_symbol_gate(
+                pos.symbol, self._execute_signals(groups[pos], pos))
         return len(pending)
 
     def _queue_paused_signals(self, signals, pos) -> None:
@@ -234,15 +279,28 @@ class StrategyRunner:
         尚未结束、TWS 历史回放先落地），开盘窗口内这条 bar 就永远没有参与判断，
         开盘特殊策略的 bar1 判定永远不成立。
         现在：激活前到达的 bar 进入早到队列，激活到点后立即按序补评估，不丢弃。
+
+        【2026-10-19 并发修订】
+        - 过渡阶段（每激活周期一次性）：入队/补评估仍在 _bar_lock 内全局串行
+          （early 队列顺序敏感；阶段只持续一次）；
+        - 稳态：不再持全局锁——同一标的经 _eval_symbol 的 FIFO 门链严格保序
+          （拉快照→决策→执行平仓→结果回传 互斥），不同标的完全并发；
+          某标的平仓等待（最坏 ≈4 分钟）不再阻塞其他标的的 bar 评估。
         """
         if not self.active:
             return
+
+        # ---- 过渡阶段：全局独占（一次性）----
         async with self._bar_lock:
             if self.activate_at and datetime.datetime.now() < self.activate_at:
                 self._enqueue_early_bar(bar)
                 return
-            await self._drain_early_bars()   # （需在持锁状态下调用）
-            await self._evaluate_bar(bar)
+            if not self._activation_done:
+                self._activation_done = True
+                await self._drain_early_bars()   # （需在持锁状态下调用）
+
+        # ---- 稳态：同标的 FIFO、跨标的并发（无全局锁）----
+        await self._eval_symbol(bar)
 
     def _enqueue_early_bar(self, bar: Bar) -> None:
         """激活前到达的 bar 入队等待（按 (symbol, dt) 去重，防重放重复入队）"""
@@ -263,7 +321,8 @@ class StrategyRunner:
                 self.logger.error(f"❌ 无法调度早到 bar 冲刷任务（将由下一根 bar 事件触发冲刷）: {e}")
 
     async def _flush_early_bars(self) -> None:
-        """激活到点 → 按序冲刷早到队列（下一根 bar 事件的 on_bar 同样会冲刷）"""
+        """激活到点 → 按序冲刷早到队列（下一根 bar 事件的 on_bar 同样会冲刷；
+        两者在同一把锁上竞争，先到者完成补评估，后到者见 _activation_done 直接跳过）"""
         try:
             now = datetime.datetime.now()
             if self.activate_at is not None and now < self.activate_at:
@@ -274,7 +333,39 @@ class StrategyRunner:
             self.logger.warning(f"⚠️ 早到 bar 冲刷等待异常（改由 bar 事件触发冲刷）: {e}")
             return
         async with self._bar_lock:
-            await self._drain_early_bars()
+            if not self._activation_done:
+                self._activation_done = True
+                await self._drain_early_bars()
+
+    # ------------------------------------------------------------------
+    # 稳态并发原语（2026-10-19）
+    # ------------------------------------------------------------------
+    async def _with_symbol_gate(self, symbol: str, coro) -> None:
+        """同一标的的异步任务严格 FIFO 串行执行（跨标的并发）。
+
+        - 先用 asyncio.Event 门链取代 asyncio.Lock：asyncio.Lock 的等待队列是
+          LIFO（release 时唤醒最新入队者），争抢时后到的同标的任务可能先执行
+          ——策略是时序状态机（前bar判定/极值/去重标记），越序会静默失效；
+          Event 链保证 T2 必然在 T1（先入队者）完整执行后才启动。
+        - 单任务失败（含 CancelledError）只影响自己：门照常放行后续任务。
+        - 调用方保证同一标的不会从两个入口并发申请（本类内 bar 路径与
+          replay 路径都用同一个门，天然互斥）。
+        """
+        prev = self._symbol_gate.get(symbol)
+        gate = asyncio.Event()
+        self._symbol_gate[symbol] = gate      # 同步赋值：单线程事件循环内原子
+        if prev is not None:
+            await prev.wait()
+        try:
+            await coro
+        finally:
+            if self._symbol_gate.get(symbol) is gate:
+                self._symbol_gate.pop(symbol, None)   # 队尾且无后续排队 → 清理
+            gate.set()                                  # 严格放行下一个同标的任务
+
+    async def _eval_symbol(self, bar: Bar) -> None:
+        """稳态入口：单标的单 bar 全流程（快照→决策→执行→回传），同标的保序"""
+        await self._with_symbol_gate(bar.symbol, self._evaluate_bar(bar))
 
     async def _drain_early_bars(self) -> None:
         """冲刷早到队列（调用方须已持有 _bar_lock）：按入队顺序补评估，单根异常隔离"""
@@ -292,55 +383,66 @@ class StrategyRunner:
                     f"❌ 早到 bar 补评估异常 [{b.symbol}] dt={b.dt}: {e}", exc_info=True)
 
     async def _evaluate_bar(self, bar: Bar) -> None:
-        """单根 bar 的实际评估：建仓门控 → 权威持仓 → 策略 → 信号执行（原 on_bar 主体）"""
+        """单根 bar 的实际评估：建仓门控 → 权威持仓 → 策略 → 信号执行（原 on_bar 主体）
+
+        并发契约（2026-10-19）：
+        - 快速阶段（门控/拉快照/策略决策/调平排队判断）持 _eval_sem —— 分钟边界
+          全组合约的快照请求受限流，不轰 TWS；
+        - 慢速阶段（_execute_signals 下单等待，最坏 ≈4 分钟）不占并发名额，
+          只由同标的门链保证该标的下一根 bar 排队等待、不同标的照常并发。
+        调用方：稳态经 _eval_symbol（持标的门）；过渡排空在 _bar_lock 全局独占下调用。
+        """
         # 【R5 标的级暂停】不再整根跳过 bar（旧逻辑会把开盘窗口 bar1 的判定整根丢弃）；
         # 暂停只作用于"信号执行"：被暂停标的照常评估（策略状态/极值正常更新），
         # 信号排队、本轮解除暂停时重放。见 _queue_paused_signals / replay_paused_signals。
 
-        # 建仓前的历史 bar 直接跳过（不拉持仓，省 TWS 请求）
-        # 例外：开盘前两分钟窗口内的 bar —— 第一分钟 bar 的 dt（=开盘时刻）天然早于
-        # 开盘+20s 的建仓时刻，若按旧门控会被丢弃，而开盘特殊策略恰恰需要这第一分钟数据
-        et = self.entry_times.get(bar.symbol)
-        if et is None or bar.dt <= et:
-            if self._in_open_window(bar):
-                self.logger.debug(
-                    f"🪟 [{bar.symbol}] bar dt={bar.dt.strftime('%H:%M:%S')} 落在开盘前两分钟窗口"
-                    f"（建仓前门控例外放行，供开盘特殊策略评估）"
-                )
-            else:
+        # ---------------- 快速阶段（受限流） ----------------
+        async with self._eval_sem:
+            # 建仓前的历史 bar 直接跳过（不拉持仓，省 TWS 请求）
+            # 例外：开盘前两分钟窗口内的 bar —— 第一分钟 bar 的 dt（=开盘时刻）天然早于
+            # 开盘+20s 的建仓时刻，若按旧门控会被丢弃，而开盘特殊策略恰恰需要这第一分钟数据
+            et = self.entry_times.get(bar.symbol)
+            if et is None or bar.dt <= et:
+                if self._in_open_window(bar):
+                    self.logger.debug(
+                        f"🪟 [{bar.symbol}] bar dt={bar.dt.strftime('%H:%M:%S')} 落在开盘前两分钟窗口"
+                        f"（建仓前门控例外放行，供开盘特殊策略评估）"
+                    )
+                else:
+                    return
+
+            # 1. 拉取权威持仓快照
+            try:
+                snap1 = await get_positions(self.ib1, self.account1)
+                snap2 = await get_positions(self.ib2, self.account2)
+            except Exception as e:
+                self.logger.warning(f"⚠️ [{bar.symbol}] 策略取持仓失败，跳过本次 bar: {e}")
                 return
 
-        # 1. 拉取权威持仓快照
-        try:
-            snap1 = await get_positions(self.ib1, self.account1)
-            snap2 = await get_positions(self.ib2, self.account2)
-        except Exception as e:
-            self.logger.warning(f"⚠️ [{bar.symbol}] 策略取持仓失败，跳过本次 bar: {e}")
-            return
+            p1 = snap1.get(bar.symbol, {'position': 0, 'avgCost': 0.0})
+            p2 = snap2.get(bar.symbol, {'position': 0, 'avgCost': 0.0})
+            pos = PositionView(
+                symbol=bar.symbol,
+                acc1_pos=int(p1['position']), acc1_avg_cost=float(p1['avgCost']),
+                acc2_pos=int(p2['position']), acc2_avg_cost=float(p2['avgCost']),
+            )
 
-        p1 = snap1.get(bar.symbol, {'position': 0, 'avgCost': 0.0})
-        p2 = snap2.get(bar.symbol, {'position': 0, 'avgCost': 0.0})
-        pos = PositionView(
-            symbol=bar.symbol,
-            acc1_pos=int(p1['position']), acc1_avg_cost=float(p1['avgCost']),
-            acc2_pos=int(p2['position']), acc2_avg_cost=float(p2['avgCost']),
-        )
+            # 2. 问策略：现在该做什么？
+            try:
+                signals = self.strategy.on_bar(bar, pos)
+            except Exception as e:
+                self.logger.error(f"❌ [{bar.symbol}] 策略执行异常: {e}", exc_info=True)
+                return
 
-        # 2. 问策略：现在该做什么？
-        try:
-            signals = self.strategy.on_bar(bar, pos)
-        except Exception as e:
-            self.logger.error(f"❌ [{bar.symbol}] 策略执行异常: {e}", exc_info=True)
-            return
+            if not signals:
+                return
 
-        if not signals:
-            return
+            # 【R5】本标的正在调平 → 信号排队，轮末 replay_paused_signals 重放
+            if bar.symbol in self._paused_symbols:
+                self._queue_paused_signals(signals, pos)
+                return
 
-        # 【R5】本标的正在调平 → 信号排队，轮末 replay_paused_signals 重放
-        if bar.symbol in self._paused_symbols:
-            self._queue_paused_signals(signals, pos)
-            return
-
+        # ---------------- 慢速阶段：执行平仓（不占并发名额） ----------------
         await self._execute_signals(signals, pos)
 
     async def _execute_signals(self, signals, pos) -> None:
